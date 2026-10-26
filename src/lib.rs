@@ -9,10 +9,14 @@
 
 pub mod brain;
 pub mod call;
+pub mod client;
 pub mod elevenlabs;
 pub mod endpoint;
+pub mod mock;
 pub mod onnx;
 pub mod openai;
+pub mod ring;
+pub mod server;
 pub mod sse;
 pub mod turn;
 pub mod vad;

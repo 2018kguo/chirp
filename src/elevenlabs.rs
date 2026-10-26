@@ -21,7 +21,8 @@ pub struct ElevenLabs {
     pub voice_id: String,
     pub tts_model: String,
     pub stt_model: String,
-    pub host: String,
+    /// `wss://api.elevenlabs.io` in production; a local mock in benchmarks.
+    pub base_url: String,
 }
 
 impl ElevenLabs {
@@ -33,12 +34,13 @@ impl ElevenLabs {
             tts_model: std::env::var("ELEVENLABS_TTS_MODEL")
                 .unwrap_or_else(|_| "eleven_flash_v2_5".into()),
             stt_model: "scribe_v2_realtime".into(),
-            host: "api.elevenlabs.io".into(),
+            base_url: std::env::var("ELEVENLABS_BASE_URL")
+                .unwrap_or_else(|_| "wss://api.elevenlabs.io".into()),
         })
     }
 
     async fn open(&self, path_and_query: &str) -> Result<Socket> {
-        let mut request = format!("wss://{}{path_and_query}", self.host).into_client_request()?;
+        let mut request = format!("{}{path_and_query}", self.base_url).into_client_request()?;
         request
             .headers_mut()
             .insert("xi-api-key", self.api_key.parse()?);

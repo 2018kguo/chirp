@@ -18,6 +18,7 @@ use tokio::time::{sleep_until, Duration, Instant as TokioInstant};
 use crate::brain::{Brain, Reply, Speakable, Utterance};
 use crate::elevenlabs::{ElevenLabs, Transcriber, Transcript};
 use crate::endpoint::TurnModel;
+use crate::ring::Ring;
 use crate::vad::{CallVad, Speech, VadModel, SAMPLE_RATE};
 
 /// Audio kept from just before speech is detected, so the turn model hears
@@ -88,8 +89,8 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
 
     let (mut transcriber, mut transcripts) = shared.elevenlabs.transcriber().await?;
     let mut vad = CallVad::new(shared.vad.clone());
-    let mut recent: Vec<f32> = Vec::with_capacity(PRE_ROLL * 2);
-    let mut turn_audio: Vec<f32> = Vec::new();
+    let mut recent = Ring::new(PRE_ROLL);
+    let mut turn_audio = Ring::new(TURN_AUDIO_MAX);
     let mut user_turn = 0u32;
     let mut awaiting_transcript = false;
     let mut turn_ended_at: Option<Instant> = None;
@@ -108,21 +109,15 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
                     .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
                     .collect();
                 transcriber.audio(&pcm).await?;
-                recent.extend_from_slice(&samples);
-                if recent.len() > PRE_ROLL {
-                    recent.drain(..recent.len() - PRE_ROLL);
-                }
+                recent.push(&samples);
                 if vad.speaking() || grace.is_some() {
-                    turn_audio.extend_from_slice(&samples);
-                    if turn_audio.len() > TURN_AUDIO_MAX {
-                        turn_audio.drain(..turn_audio.len() - TURN_AUDIO_MAX);
-                    }
+                    turn_audio.push(&samples);
                 }
                 match vad.push(&samples).await? {
                     Some(Speech::Started) => {
                         grace = None;
                         if turn_audio.is_empty() {
-                            turn_audio.extend_from_slice(&recent);
+                            turn_audio.push(&recent.to_vec());
                         }
                         if let Some(task) = speaking.take() {
                             // Barge-in: stop speaking; the brain decides what
@@ -132,7 +127,7 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
                         }
                     }
                     Some(Speech::Stopped) => {
-                        let probability = shared.turn.complete(turn_audio.clone()).await?;
+                        let probability = shared.turn.complete(turn_audio.to_vec()).await?;
                         let _ = to_client.send(event(json!({ "type": "turn", "complete": probability }))).await;
                         if probability > COMPLETE {
                             end_turn(&mut transcriber, &mut turn_audio, &mut awaiting_transcript, &mut turn_ended_at).await?;
@@ -203,7 +198,7 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
 
 async fn end_turn(
     transcriber: &mut Transcriber,
-    turn_audio: &mut Vec<f32>,
+    turn_audio: &mut Ring,
     awaiting_transcript: &mut bool,
     turn_ended_at: &mut Option<Instant>,
 ) -> Result<()> {

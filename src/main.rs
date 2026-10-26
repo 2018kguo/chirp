@@ -7,11 +7,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use axum::extract::{State, WebSocketUpgrade};
-use axum::response::IntoResponse;
-use axum::routing::get;
-use axum::Router;
-use chirp::call::{self, Shared, SpeechPolicy};
+use chirp::call::{Shared, SpeechPolicy};
 use chirp::elevenlabs::ElevenLabs;
 use chirp::endpoint::TurnModel;
 use chirp::openai::OpenAiBrain;
@@ -64,23 +60,17 @@ async fn main() -> Result<()> {
         brain_model: std::env::var("CHIRP_BRAIN_MODEL").context("CHIRP_BRAIN_MODEL")?,
         system_prompt: std::env::var("CHIRP_SYSTEM_PROMPT").ok(),
     };
-    let router = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/v1/calls", get(open_call))
-        .with_state(app);
+    let router = chirp::server::router(app.shared.clone(), move || {
+        OpenAiBrain::new(
+            app.http.clone(),
+            &app.brain_url,
+            &app.brain_key,
+            &app.brain_model,
+            app.system_prompt.as_deref(),
+        )
+    });
     let address: SocketAddr = ([0, 0, 0, 0], env_or("PORT", 7861u16)).into();
     tracing::info!(%address, "chirp listening");
     axum::serve(tokio::net::TcpListener::bind(address).await?, router).await?;
     Ok(())
-}
-
-async fn open_call(State(app): State<App>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
-    let brain = OpenAiBrain::new(
-        app.http,
-        &app.brain_url,
-        &app.brain_key,
-        &app.brain_model,
-        app.system_prompt.as_deref(),
-    );
-    upgrade.on_upgrade(move |socket| call::run(socket, app.shared, brain))
 }
