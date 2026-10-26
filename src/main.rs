@@ -23,6 +23,22 @@ struct App {
     system_prompt: Option<String>,
 }
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static JEMALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static DHAT: dhat::Alloc = dhat::Alloc;
+
+#[cfg(feature = "heap-stats")]
+#[global_allocator]
+static ALLOCATOR: chirp::heap::Counting = chirp::heap::Counting;
+
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
         .ok()
@@ -32,6 +48,8 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -75,8 +93,29 @@ async fn main() -> Result<()> {
             app.system_prompt.as_deref(),
         )
     });
+    #[cfg(feature = "heap-stats")]
+    let router = router.route(
+        "/debug/heap",
+        axum::routing::get(|| async {
+            format!(
+                "{} {}",
+                chirp::heap::live_bytes(),
+                chirp::heap::allocation_calls()
+            )
+        }),
+    );
     let address: SocketAddr = ([0, 0, 0, 0], env_or("PORT", 7861u16)).into();
     tracing::info!(%address, "chirp listening");
-    axum::serve(tokio::net::TcpListener::bind(address).await?, router).await?;
+    // On SIGTERM, stop accepting calls and return, so profilers can write out.
+    let terminate = async {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            signal.recv().await;
+        }
+    };
+    axum::serve(tokio::net::TcpListener::bind(address).await?, router)
+        .with_graceful_shutdown(terminate)
+        .await?;
     Ok(())
 }

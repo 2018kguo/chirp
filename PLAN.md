@@ -73,3 +73,16 @@ numbers that matter, not a port.
   quiet windows when p >= 0.9 decides ~125 ms sooner than the baseline but
   raises cut-offs (a turn ended, then the speaker kept talking) from 52% to
   60% on human speech. So: keep the decision, speculate the work.
+- **Memory per call** (`bench_load` with `--features heap-stats`, slope
+  between call counts so fixed costs cancel): live heap 890 → 120 KB per call
+  (i16 rings that grow with the turn: −492 KB; WebSocket read buffers 128 KiB
+  → 4–8 KiB: −282 KB); RSS slope ~175 KB per call. The earlier "1.4 MB per
+  call" divided fixed costs by the call count. Allocations 1,112 → ~230 per
+  call-second (hand-written STT messages into a reclaimed BytesMut, a reply
+  slot per call instead of a oneshot per window, reused buffers).
+- **Fixed cost ~450 MB under load**, mostly the Smart Turn sessions' ONNX
+  Runtime arenas. Turning the arena off saves ~116 MB but costs +20% per
+  decision; capping the VAD batch changed nothing. Smart Turn threads are now
+  warmed at startup: arenas exist before the first call, and p99 at 1,000
+  calls fell from 975–1,649 ms to 740 ms (cold sessions had paid their first
+  run on some caller's pause).

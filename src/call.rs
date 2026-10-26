@@ -96,6 +96,8 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
     let mut uncommitted_speech = false;
     let mut turn_ended_at: Option<Instant> = None;
     let mut speaking: Option<AbortOnDrop> = None;
+    // Reused for every frame: the frame path allocates nothing of its own.
+    let mut samples: Vec<f32> = Vec::with_capacity(320);
     let mut unprompted = tokio::time::interval(UNPROMPTED_POLL);
 
     loop {
@@ -130,10 +132,8 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
             message = client_rx.next() => {
                 let Some(Ok(message)) = message else { break };
                 let Message::Binary(pcm) = message else { continue };
-                let samples: Vec<f32> = pcm
-                    .chunks_exact(2)
-                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
-                    .collect();
+                samples.clear();
+                samples.extend(pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0));
                 transcriber.audio(&pcm).await?;
                 for turn_event in turns.push(&samples).await? {
                     match turn_event {

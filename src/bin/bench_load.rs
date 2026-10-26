@@ -32,7 +32,18 @@ impl Process {
 }
 
 impl Drop for Process {
+    /// SIGTERM first (so a profiling build can write its report), then
+    /// SIGKILL to the whole group after a few seconds.
     fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.0.id().to_string()])
+            .status();
+        for _ in 0..100 {
+            if matches!(self.0.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let _ = Command::new("kill")
             .args(["-KILL", &format!("-{}", self.0.id())])
             .status();
@@ -166,7 +177,11 @@ async fn main() -> Result<()> {
                 .env("CHIRP_BRAIN_KEY", "mock")
                 .env("CHIRP_BRAIN_MODEL", "mock")
                 .env("RUST_LOG", "warn");
-            for name in ["CHIRP_VAD_THREADS", "CHIRP_TURN_THREADS"] {
+            for name in [
+                "CHIRP_VAD_THREADS",
+                "CHIRP_TURN_THREADS",
+                "CHIRP_VAD_MAX_BATCH",
+            ] {
                 if let Ok(value) = std::env::var(name) {
                     command.env(name, value);
                 }
@@ -209,7 +224,19 @@ async fn main() -> Result<()> {
     )?);
     let speech_end = chirp::client::speech_end(&speech);
     let url = format!("ws://127.0.0.1:{port}/v1/calls");
-    let (cpu_before, _) = usage(pid)?;
+    let (cpu_before, rss_before) = usage(pid)?;
+    // Live heap, when the engine serves it (chirp built with `heap-stats`).
+    let heap = |port: u16| async move {
+        let body = reqwest::get(format!("http://127.0.0.1:{port}/debug/heap"))
+            .await
+            .ok()?
+            .text()
+            .await
+            .ok()?;
+        let mut fields = body.split_whitespace().map(|f| f.parse::<f64>().ok());
+        Some((fields.next()??, fields.next()??, Instant::now()))
+    };
+    let heap_before = heap(port).await;
     let started = Instant::now();
     let until = started + Duration::from_secs(seconds);
     let callers: Vec<_> = (0..calls)
@@ -236,9 +263,20 @@ async fn main() -> Result<()> {
         })
         .collect();
     let mut peak_rss = 0f64;
+    let mut heap_mid = None;
+    let mut heap_late = None;
     while Instant::now() < until {
         tokio::time::sleep(Duration::from_secs(1)).await;
         peak_rss = peak_rss.max(usage(pid)?.1);
+        // Mid-run, every caller connected and conversing.
+        if heap_mid.is_none() && started.elapsed() > Duration::from_secs(seconds / 2) {
+            heap_mid = heap(port).await;
+        } else if heap_mid.is_some()
+            && heap_late.is_none()
+            && started.elapsed() > Duration::from_secs(seconds.saturating_sub(2))
+        {
+            heap_late = heap(port).await;
+        }
     }
     let (cpu_after, _) = usage(pid)?;
     let wall = started.elapsed().as_secs_f64();
@@ -258,6 +296,20 @@ async fn main() -> Result<()> {
     }
     latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let cpu = cpu_after - cpu_before;
+    if let (Some((before, _, _)), Some((mid, mid_calls, mid_at))) = (heap_before, heap_mid) {
+        // Allocation rate late in the run, all callers live.
+        let per_call_second = heap_late.map(|(_, end_calls, end_at)| {
+            (end_calls - mid_calls) / end_at.duration_since(mid_at).as_secs_f64() / calls as f64
+        });
+        println!(
+            "heap: {:.1} MB idle, {:.1} MB mid-run, {:.1} KB per call; RSS {:.1} KB per call over idle; {:.0} allocations per call-second",
+            before / 1e6,
+            mid / 1e6,
+            (mid - before) / calls as f64 / 1e3,
+            (peak_rss - rss_before) * 1024.0 / calls as f64,
+            per_call_second.unwrap_or(f64::NAN)
+        );
+    }
     let expected_turns = calls as f64 * (seconds as f64 / 5.3).floor();
     println!(
         "{engine} calls={calls} cores={:.2} cpu_ms_per_call_s={:.2} rss_mb={peak_rss:.0} rss_mb_per_call={:.2} turns={} (~{expected_turns:.0} expected) failed_calls={failed} latency_ms p50={:.0} p99={:.0}",

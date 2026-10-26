@@ -12,6 +12,8 @@ pub mod call;
 pub mod client;
 pub mod elevenlabs;
 pub mod endpoint;
+#[cfg(feature = "heap-stats")]
+pub mod heap;
 pub mod mock;
 pub mod onnx;
 pub mod openai;

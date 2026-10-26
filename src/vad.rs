@@ -17,8 +17,8 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use ort::session::Session;
-use ort::value::Tensor;
-use tokio::sync::oneshot;
+use ort::value::TensorRef;
+use tokio::sync::Notify;
 
 pub const SAMPLE_RATE: usize = 16_000;
 /// Samples the model scores at a time (32 ms at 16 kHz).
@@ -29,6 +29,14 @@ const STATE: usize = 2 * 128;
 /// Cap on one batched run; more queued windows wait for the next.
 const MAX_BATCH: usize = 256;
 
+/// `CHIRP_VAD_MAX_BATCH` overrides [`MAX_BATCH`] (experiments).
+fn max_batch() -> usize {
+    std::env::var("CHIRP_VAD_MAX_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MAX_BATCH)
+}
+
 /// Pipecat `VADParams` defaults.
 pub const CONFIDENCE: f32 = 0.7;
 const START_WINDOWS: u32 = 6; // round(0.2 s / 32 ms)
@@ -38,10 +46,31 @@ const RESET_INTERVAL_WINDOWS: u32 = (2 * SAMPLE_RATE / WINDOW) as u32;
 const RESET_MAX_CONFIDENCE: f32 = 0.1;
 const RESET_LOW_WINDOWS: u32 = 5;
 
+/// A window's confidence and the call's next recurrent state.
+type Scored = (f32, [f32; STATE]);
+
+/// Where a call's scored windows land: one per call, made once, reused for
+/// every window (a channel would preallocate blocks of 32 ~1 KB slots).
+#[derive(Default)]
+struct Reply {
+    /// The window's confidence and the call's next state; `None` if its batch failed.
+    scored: Mutex<Option<Option<Scored>>>,
+    ready: Notify,
+}
+
+impl Reply {
+    fn put(&self, scored: Option<Scored>) {
+        if let Ok(mut slot) = self.scored.lock() {
+            *slot = Some(scored);
+        }
+        self.ready.notify_one();
+    }
+}
+
 struct Request {
     input: [f32; CONTEXT + WINDOW],
     state: [f32; STATE],
-    reply: oneshot::Sender<(f32, [f32; STATE])>,
+    reply: Arc<Reply>,
 }
 
 /// Cheap to clone; every call holds one.
@@ -61,7 +90,7 @@ impl VadModel {
         let (requests, queue) = std_mpsc::channel::<Request>();
         let queue = Arc::new(Mutex::new(queue));
         for index in 0..threads.max(1) {
-            let session = crate::onnx::session(model_path)?;
+            let session = crate::onnx::session_dynamic_batch(model_path)?;
             let queue = queue.clone();
             thread::Builder::new()
                 .name(format!("vad-{index}"))
@@ -69,52 +98,53 @@ impl VadModel {
         }
         Ok(Self { requests })
     }
+}
 
-    async fn score(
-        &self,
-        input: [f32; CONTEXT + WINDOW],
-        state: [f32; STATE],
-    ) -> Result<(f32, [f32; STATE])> {
-        let (reply, answer) = oneshot::channel();
-        self.requests
-            .send(Request {
-                input,
-                state,
-                reply,
-            })
-            .map_err(|_| anyhow::anyhow!("VAD thread stopped"))?;
-        answer.await.context("VAD thread dropped a window")
-    }
+/// Batch buffers, kept by each VAD thread and reused for every batch.
+#[derive(Default)]
+struct Scratch {
+    input: Vec<f32>,
+    state: Vec<f32>,
 }
 
 fn run_batches(mut session: Session, queue: &Mutex<std_mpsc::Receiver<Request>>) {
-    let mut batch: Vec<Request> = Vec::with_capacity(MAX_BATCH);
+    let max_batch = max_batch();
+    let mut batch: Vec<Request> = Vec::with_capacity(max_batch);
+    let mut scratch = Scratch::default();
     loop {
         {
             // Hold the queue only while taking a batch, not while scoring it.
             let Ok(queue) = queue.lock() else { return };
             let Ok(first) = queue.recv() else { return };
             batch.push(first);
-            while batch.len() < MAX_BATCH {
+            while batch.len() < max_batch {
                 match queue.try_recv() {
                     Ok(next) => batch.push(next),
                     Err(_) => break,
                 }
             }
         }
-        if let Err(error) = score_batch(&mut session, &mut batch) {
+        if let Err(error) = score_batch(&mut session, &mut batch, &mut scratch) {
             tracing::error!(%error, size = batch.len(), "VAD batch failed");
-            // Dropping the replies fails those windows; the calls carry on.
+            for request in batch.drain(..) {
+                request.reply.put(None);
+            }
         }
         batch.clear();
     }
 }
 
-fn score_batch(session: &mut Session, batch: &mut Vec<Request>) -> Result<()> {
+fn score_batch(
+    session: &mut Session,
+    batch: &mut Vec<Request>,
+    scratch: &mut Scratch,
+) -> Result<()> {
     let n = batch.len();
-    let mut input = Vec::with_capacity(n * (CONTEXT + WINDOW));
+    let Scratch { input, state } = scratch;
+    input.clear();
     // The model's state is [2, batch, 128]: layer-major, so gather per layer.
-    let mut state = vec![0f32; n * STATE];
+    state.clear();
+    state.resize(n * STATE, 0.0);
     for (i, request) in batch.iter().enumerate() {
         input.extend_from_slice(&request.input);
         for layer in 0..2 {
@@ -123,9 +153,9 @@ fn score_batch(session: &mut Session, batch: &mut Vec<Request>) -> Result<()> {
         }
     }
     let outputs = session.run(ort::inputs![
-        "input" => Tensor::from_array(([n, CONTEXT + WINDOW], input))?,
-        "state" => Tensor::from_array(([2usize, n, 128], state))?,
-        "sr" => Tensor::from_array(([0usize; 0], vec![SAMPLE_RATE as i64]))?,
+        "input" => TensorRef::from_array_view(([n, CONTEXT + WINDOW], &input[..]))?,
+        "state" => TensorRef::from_array_view(([2usize, n, 128], &state[..]))?,
+        "sr" => TensorRef::from_array_view(([0usize; 0], &[SAMPLE_RATE as i64][..]))?,
     ])?;
     let (_, probabilities) = outputs["output"].try_extract_tensor::<f32>()?;
     let (_, next_state) = outputs["stateN"].try_extract_tensor::<f32>()?;
@@ -135,7 +165,7 @@ fn score_batch(session: &mut Session, batch: &mut Vec<Request>) -> Result<()> {
             let from = (layer * n + i) * 128;
             state[layer * 128..(layer + 1) * 128].copy_from_slice(&next_state[from..from + 128]);
         }
-        let _ = request.reply.send((probabilities[i], state));
+        request.reply.put(Some((probabilities[i], state)));
     }
     Ok(())
 }
@@ -150,6 +180,7 @@ pub enum Speech {
 /// and whether the user is speaking.
 pub struct CallVad {
     model: VadModel,
+    reply: Arc<Reply>,
     pending: Vec<f32>,
     context: [f32; CONTEXT],
     state: [f32; STATE],
@@ -165,6 +196,7 @@ impl CallVad {
     pub fn new(model: VadModel) -> Self {
         Self {
             model,
+            reply: Arc::default(),
             pending: Vec::with_capacity(2 * WINDOW),
             context: [0.0; CONTEXT],
             state: [0.0; STATE],
@@ -201,7 +233,28 @@ impl CallVad {
             input[..CONTEXT].copy_from_slice(&self.context);
             input[CONTEXT..].copy_from_slice(&self.pending[..WINDOW]);
             self.pending.drain(..WINDOW);
-            let (confidence, state) = self.model.score(input, self.state).await?;
+            self.model
+                .requests
+                .send(Request {
+                    input,
+                    state: self.state,
+                    reply: self.reply.clone(),
+                })
+                .map_err(|_| anyhow::anyhow!("VAD thread stopped"))?;
+            // One window in flight per call: wait for its answer.
+            let scored = loop {
+                if let Some(scored) = self
+                    .reply
+                    .scored
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                {
+                    break scored;
+                }
+                self.reply.ready.notified().await;
+            };
+            let (confidence, state) = scored.context("VAD batch failed")?;
             self.context.copy_from_slice(&input[WINDOW..]);
             self.state = state;
             self.last_confidence = confidence;

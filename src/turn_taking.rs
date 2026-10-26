@@ -68,7 +68,8 @@ pub struct TurnTaker {
     policy: Policy,
     vad: CallVad,
     turn: TurnModel,
-    window: Vec<f32>,
+    window: [f32; WINDOW],
+    filled: usize,
     recent: Ring,
     turn_audio: Ring,
     /// Consecutive quiet windows while the caller holds the floor.
@@ -85,7 +86,8 @@ impl TurnTaker {
             policy,
             vad,
             turn,
-            window: Vec::with_capacity(WINDOW),
+            window: [0.0; WINDOW],
+            filled: 0,
             recent: Ring::new(PRE_ROLL),
             turn_audio: Ring::new(TURN_AUDIO_MAX),
             quiet: 0,
@@ -109,9 +111,11 @@ impl TurnTaker {
     pub async fn push(&mut self, samples: &[f32]) -> Result<Vec<TurnEvent>> {
         let mut events = Vec::new();
         for &sample in samples {
-            self.window.push(sample);
-            if self.window.len() == WINDOW {
-                let window = std::mem::replace(&mut self.window, Vec::with_capacity(WINDOW));
+            self.window[self.filled] = sample;
+            self.filled += 1;
+            if self.filled == WINDOW {
+                self.filled = 0;
+                let window = self.window;
                 self.clock += WINDOW as u64;
                 self.window_done(&window, &mut events).await?;
             }

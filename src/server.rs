@@ -27,7 +27,12 @@ where
                             return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "at capacity")
                                 .into_response();
                         }
+                        // Callers send 640-byte frames: small buffers, and a cap
+                        // so no one can make the server hold a huge message.
                         upgrade
+                            .read_buffer_size(4 * 1024)
+                            .write_buffer_size(0)
+                            .max_message_size(64 * 1024)
                             .on_upgrade(move |socket| call::run(socket, shared, brain))
                             .into_response()
                     }

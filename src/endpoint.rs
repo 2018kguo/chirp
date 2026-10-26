@@ -46,6 +46,10 @@ impl TurnModel {
         let wait_micros = Arc::new(AtomicU64::new(0));
         for index in 0..threads.max(1) {
             let mut model = SmartTurn::new(model_path)?;
+            // One run at startup: the session sizes its buffers now, not on
+            // some caller's first pause, and resident memory is all there
+            // before the first call.
+            model.predict(&[0.0; crate::vad::SAMPLE_RATE])?;
             let (queue, wait_micros) = (queue.clone(), wait_micros.clone());
             thread::Builder::new()
                 .name(format!("turn-{index}"))

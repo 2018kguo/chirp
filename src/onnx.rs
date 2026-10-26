@@ -10,7 +10,20 @@ use ort::environment::Environment;
 use ort::session::builder::AutoDevicePolicy;
 use ort::session::Session;
 
+/// Opens a model whose input shape never changes (Smart Turn: batch 1).
 pub fn session(model_path: &Path) -> Result<Session> {
+    open(model_path, false)
+}
+
+/// Opens a model run at varying batch sizes (the VAD). ONNX Runtime's arena
+/// and memory pattern size themselves to the largest batch seen and keep
+/// it, which grew resident memory with the call count; without them, a run's
+/// activations are freed after it (PLAN.md findings).
+pub fn session_dynamic_batch(model_path: &Path) -> Result<Session> {
+    open(model_path, true)
+}
+
+fn open(model_path: &Path, dynamic_batch: bool) -> Result<Session> {
     // A Mutex, not a OnceLock: two threads building the environment at once
     // make the second `build` fail ("only one environment").
     static ENVIRONMENT: Mutex<Option<Environment>> = Mutex::new(None);
@@ -26,11 +39,17 @@ pub fn session(model_path: &Path) -> Result<Session> {
         );
     }
     let environment = guard.as_ref().expect("set above");
+    let arena = !dynamic_batch;
     Session::builder(environment)
         .map_err(|e| anyhow!("{e}"))?
-        // ort's default policy registers CoreML on macOS, whose fp16 outputs
-        // differ from the CPU kernels production (Linux) runs.
+        // CPU only. ort's default device policy registers CoreML on macOS
+        // (fp16 outputs that differ from the CPU kernels production runs), and
+        // still does alongside an explicitly registered provider.
         .with_auto_device(AutoDevicePolicy::PreferCPU)
+        .map_err(|e| anyhow!("{e}"))?
+        .with_execution_providers([ort::ep::CPU::default().with_arena_allocator(arena).build()])
+        .map_err(|e| anyhow!("{e}"))?
+        .with_memory_pattern(arena)
         .map_err(|e| anyhow!("{e}"))?
         .with_intra_threads(1)
         .map_err(|e| anyhow!("{e}"))?

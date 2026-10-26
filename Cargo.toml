@@ -7,11 +7,23 @@ license = "MIT"
 repository = "https://github.com/2018kguo/chirp"
 description = "A voice engine that serves many calls per process"
 
+[features]
+# Count live heap bytes and serve them at /debug/heap (benchmarks).
+heap-stats = []
+# Heap profile (dhat-heap.json, written on SIGTERM): where the bytes are.
+dhat-heap = ["dep:dhat"]
+# Allocator experiments (bench_load reports RSS per call).
+mimalloc = ["dep:mimalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 bytes = "1"
+dhat = { version = "0.3", optional = true }
+mimalloc = { version = "0.1", optional = true, default-features = false }
+tikv-jemallocator = { version = "0.6", optional = true }
 futures = "0.3"
 ort = { version = "=2.0.0-rc.15", features = ["download-binaries"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
