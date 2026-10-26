@@ -1,0 +1,3 @@
+[env]
+# The prebuilt ONNX Runtime (ort download-binaries) targets macOS 13.4.
+MACOSX_DEPLOYMENT_TARGET = "13.4"

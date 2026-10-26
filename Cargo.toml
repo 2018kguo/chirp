@@ -1,0 +1,36 @@
+[package]
+name = "chirp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+repository = "https://github.com/2018kguo/chirp"
+description = "A voice engine that serves many calls per process"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+bytes = "1"
+futures = "0.3"
+ort = { version = "=2.0.0-rc.15", features = ["download-binaries"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "stream",
+  "rustls-tls",
+] }
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v5", "v7"] }
+
+hound = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
