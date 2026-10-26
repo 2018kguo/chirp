@@ -158,12 +158,21 @@ numbers that matter, not a port.
   (mel 1.3%, call loop 0.8%, ring 0.4%); kernel networking 12.5%; the rest
   onnxruntime: int8 GEMM `MlasGemmU8X8KernelAvx512Core` 27.4%,
   QLinearSoftmax 12.0%, fp32 GEMM 10.5%, requantize 3.1%. The GEMMs run
-  U8U8 (unsigned weights in the published model), which cannot use VNNI
-  (`vpdpbusd` is u8 x s8); the convs already take the VNNI kernel.
+  (correction below: the weight GEMMs already run VNNI).
 - **Rejected: dynamic U8S8 requantization** of the fp32 model
   (`smart-turn-v3.2-gpu.onnx`, value_info stripped): 48.8 ms vs 37.5 ms
   for the published static U8U8, one thread (fp32: 74.0 ms); per-channel
   the same. Closer to fp32's output, but a DynamicQuantizeLinear per matmul
-  and fp32 softmax cost more than VNNI saves. **Next lever:** static QDQ
-  U8S8 calibrated on held-out audio (not the test set), scored on
-  bench_turns for unchanged verdicts.
+  and fp32 softmax cost more than VNNI saves.
+- **Correction: the published Smart Turn int8 model is already static QDQ
+  U8S8, and already runs VNNI.** Its 31 weight tensors are INT8; Pipecat's
+  train.py quantizes with QDQ, QUInt8 activations, QInt8 per-channel
+  weights, Entropy calibration on 1,024 stratified clips, Conv/MatMul/Gemm
+  only. perf annotate of `MlasGemmU8X8KernelAvx512Core` on the c7a: 42% of
+  its samples on `vpdpbusds` (VNNI, the weight matmuls), 16% on `vpmaddwd`
+  (U8U8: attention's activation x activation matmuls). Our own static
+  requantization (MinMax, 300 train-split clips) scored 86.3% vs the
+  published 94.9% (fp32 95.3%) on the 789 English test clips, 120 verdicts
+  flipped: rejected. Smart Turn is at onnxruntime's floor here; what is
+  left is QLinearSoftmax (~20% of a decision, onnxruntime's per-row
+  std::function) and the attention U8U8 matmuls.
