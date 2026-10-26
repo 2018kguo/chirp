@@ -141,3 +141,25 @@ async fn a_failing_provider_closes_the_call_promptly() {
         "the call stayed open {after_turn:.0} ms after its turn ended (the brain needed 4,000)"
     );
 }
+
+/// A commit the transcriber never answers can't leave the turn unanswered:
+/// after the deadline it counts as empty and the turn is still closed out.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unanswered_commit_does_not_leave_the_turn_hanging() {
+    let script = Script {
+        stt_unanswered_commits: usize::MAX,
+        ..Script::default()
+    };
+    let url = chirp_on(script).await;
+    let outcome = client::call(&url, &question(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    let transcript = outcome
+        .event_at("transcript", |e| e["final"] == true)
+        .expect("the turn was never closed out");
+    let wait = ms(transcript) - ms(turn_end(&outcome));
+    assert!(
+        wait < 3_500.0,
+        "closed out {wait:.0} ms after the turn ended"
+    );
+}

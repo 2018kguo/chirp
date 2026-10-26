@@ -114,6 +114,10 @@ impl ElevenLabs {
                 let event = match value.get("message_type").and_then(Value::as_str) {
                     Some("partial_transcript") => Transcript::Partial(words),
                     Some("committed_transcript") => Transcript::Committed(words),
+                    // Answers to a commit that carry no text: the commit is done, empty.
+                    Some("commit_throttled" | "insufficient_audio_activity") => {
+                        Transcript::Committed(String::new())
+                    }
                     Some("session_started" | "committed_transcript_with_timestamps") => continue,
                     other => Transcript::Error(format!("{}: {text}", other.unwrap_or("unknown"))),
                 };
@@ -255,6 +259,7 @@ mod tests {
             (&[1u8, 2, 3, 250, 0, 7][..], false),
             (&[][..], true),
             (&[9u8; 640][..], false),
+            (&[255u8, 128, 0, 1, 2][..], true),
         ] {
             let text = input_audio_chunk(&mut buffer, pcm, commit);
             let parsed: Value = serde_json::from_str(text.as_str()).unwrap();

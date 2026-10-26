@@ -37,6 +37,8 @@ pub struct Script {
     /// Drop the transcription connection this long after a committed
     /// transcript, as a failing provider would.
     pub stt_drop_after_commit: Option<Duration>,
+    /// The first this many commits get no answer at all.
+    pub stt_unanswered_commits: usize,
 }
 
 impl Default for Script {
@@ -50,6 +52,7 @@ impl Default for Script {
             tts_first_audio: Duration::from_millis(150),
             tts_chunk_gap: Duration::from_millis(50),
             stt_drop_after_commit: None,
+            stt_unanswered_commits: 0,
         }
     }
 }
@@ -113,6 +116,7 @@ async fn stt(State(script): State<Script>, upgrade: WebSocketUpgrade) -> impl In
         let (send, mut stream) = outbox(socket);
         let _ = send.send(json!({ "message_type": "session_started" }));
         let (dropped, mut drop_now) = mpsc::unbounded_channel::<()>();
+        let mut unanswered = script.stt_unanswered_commits;
         loop {
             let message = tokio::select! {
                 message = stream.next() => message,
@@ -120,7 +124,9 @@ async fn stt(State(script): State<Script>, upgrade: WebSocketUpgrade) -> impl In
             };
             let Some(Ok(Message::Text(text))) = message else { break };
             let Ok(message) = serde_json::from_str::<Value>(&text) else { continue };
-            if message["commit"] == true {
+            if message["commit"] == true && unanswered > 0 {
+                unanswered -= 1;
+            } else if message["commit"] == true {
                 let (send, script, dropped) = (send.clone(), script.clone(), dropped.clone());
                 tokio::spawn(async move {
                     tokio::time::sleep(script.stt_commit).await;

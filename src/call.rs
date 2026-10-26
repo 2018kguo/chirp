@@ -24,6 +24,9 @@ use crate::vad::{CallVad, VadModel};
 
 /// How often a quiet call asks its brain for an unprompted reply.
 const UNPROMPTED_POLL: Duration = Duration::from_secs(2);
+/// A commit the provider never answers resolves as empty, so one lost
+/// reply can't leave the turn unanswered and the call deaf.
+const COMMIT_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Process-wide pieces every call shares.
 #[derive(Clone)]
@@ -102,6 +105,8 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
     // Reused for every frame: the frame path allocates nothing of its own.
     let mut samples: Vec<f32> = Vec::with_capacity(320);
     let mut unprompted = tokio::time::interval(UNPROMPTED_POLL);
+    // Last commit sent or answered: the deadline runs from here.
+    let mut commit_progress = tokio::time::Instant::now();
 
     loop {
         let input = tokio::select! {
@@ -125,13 +130,21 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
                     let _ = to_client.send(event(json!({ "type": "transcript", "text": text, "final": false }))).await;
                     continue;
                 }
-                Some(Transcript::Committed(text)) => state.on(Input::Committed(text)),
+                Some(Transcript::Committed(text)) => {
+                    commit_progress = tokio::time::Instant::now();
+                    state.on(Input::Committed(text))
+                }
                 Some(Transcript::Error(error)) => {
                     let _ = to_client.send(event(json!({ "type": "error", "message": error }))).await;
                     continue;
                 }
                 None => anyhow::bail!("speech-to-text stream closed"),
             },
+            _ = tokio::time::sleep_until(commit_progress + COMMIT_DEADLINE), if state.pending().1 > 0 => {
+                tracing::warn!(commits = state.pending().1, "speech-to-text never answered; treating as empty");
+                commit_progress = tokio::time::Instant::now();
+                (0..state.pending().1).flat_map(|_| state.on(Input::Committed(String::new()))).collect()
+            }
             Some(finished) = reply_done.recv() => {
                 if finished != generation {
                     continue;
@@ -159,7 +172,10 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
         };
         for action in input {
             match action {
-                Action::Commit => transcriber.commit().await?,
+                Action::Commit => {
+                    commit_progress = tokio::time::Instant::now();
+                    transcriber.commit().await?
+                }
                 Action::Interrupt => {
                     // Barge-in: stop speaking; the brain decides what
                     // happens to the work behind that reply.
