@@ -9,6 +9,7 @@
 
 pub mod brain;
 pub mod call;
+pub mod call_state;
 pub mod client;
 pub mod elevenlabs;
 pub mod endpoint;

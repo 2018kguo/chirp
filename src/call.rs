@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 use crate::brain::{Brain, Reply, Speakable, Utterance};
+use crate::call_state::{Action, CallState, Input};
 use crate::elevenlabs::{ElevenLabs, Transcript};
 use crate::endpoint::TurnModel;
 use crate::turn_taking::{Policy, TurnEvent, TurnTaker};
@@ -88,117 +89,121 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
         shared.turn.clone(),
         shared.turn_policy.clone(),
     );
-    let mut user_turn = 0u32;
-    // The turn's text so far, from segments committed at each pause; the
-    // speculative commits mean it is usually complete when the turn ends.
-    let mut turn_text = String::new();
-    let mut commits_in_flight = 0u32;
-    let mut uncommitted_speech = false;
-    let mut turn_ended_at: Option<Instant> = None;
+    // Every decision is the reducer's (checked over all interleavings in
+    // tests/call_state_model.rs); this loop only does the I/O it asks for.
+    let mut state = CallState::default();
+    let mut ended_at: Option<Instant> = None;
     let mut speaking: Option<AbortOnDrop> = None;
+    // Replies say when they finish, so the state knows the call is quiet.
+    // Each reply carries its generation, so a finish queued just before a
+    // newer reply started can't mark the newer one finished.
+    let (reply_done_tx, mut reply_done) = mpsc::channel::<u64>(4);
+    let mut generation = 0u64;
     // Reused for every frame: the frame path allocates nothing of its own.
     let mut samples: Vec<f32> = Vec::with_capacity(320);
     let mut unprompted = tokio::time::interval(UNPROMPTED_POLL);
 
     loop {
-        // The turn is over and all its segments are in: answer it.
-        if commits_in_flight == 0 && turn_ended_at.is_some() {
-            let text = std::mem::take(&mut turn_text);
-            let started = turn_ended_at.take();
-            let _ = to_client
-                .send(event(
-                    json!({ "type": "transcript", "text": text, "final": true }),
-                ))
-                .await;
-            if !text.is_empty() {
-                user_turn += 1;
-                let (brain, shared, to_client) = (brain.clone(), shared.clone(), to_client.clone());
-                let utterance = Utterance {
-                    text,
-                    index: user_turn,
-                };
-                // Replacing the previous reply aborts it.
-                speaking = Some(AbortOnDrop(tokio::spawn(async move {
-                    let reply = async {
-                        let (speaker, reply) =
-                            tokio::join!(shared.elevenlabs.speaker(), brain.reply(utterance));
-                        speak(reply?, speaker?, &shared.speech, &to_client, started).await
-                    };
-                    report(reply.await, &to_client).await;
-                })));
-            }
-        }
-        tokio::select! {
+        let input = tokio::select! {
             message = client_rx.next() => {
                 let Some(Ok(message)) = message else { break };
                 let Message::Binary(pcm) = message else { continue };
                 samples.clear();
                 samples.extend(pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0));
                 transcriber.audio(&pcm).await?;
+                let mut actions = Vec::new();
                 for turn_event in turns.push(&samples).await? {
-                    match turn_event {
-                        TurnEvent::SpeechStarted => {
-                            uncommitted_speech = true;
-                            if speaking.take().is_some() {
-                                // Barge-in: stop speaking; the brain decides what
-                                // happens to the work behind that reply.
-                                let _ = to_client.send(event(json!({ "type": "interrupt" }))).await;
-                            }
-                        }
-                        TurnEvent::Assessed { probability } => {
-                            let _ = to_client.send(event(json!({ "type": "turn", "complete": probability }))).await;
-                        }
-                        TurnEvent::Paused => {
-                            // Speculative: if the turn is ending, its transcript
-                            // is on the way before the VAD has called the pause.
-                            transcriber.commit().await?;
-                            commits_in_flight += 1;
-                            uncommitted_speech = false;
-                        }
-                        TurnEvent::Ended { by } => {
-                            if uncommitted_speech {
-                                transcriber.commit().await?;
-                                commits_in_flight += 1;
-                                uncommitted_speech = false;
-                            }
-                            turn_ended_at = Some(Instant::now());
-                            let _ = to_client.send(event(json!({ "type": "turn_end", "by": format!("{by:?}") }))).await;
-                        }
+                    if let TurnEvent::Assessed { probability } = turn_event {
+                        let _ = to_client.send(event(json!({ "type": "turn", "complete": probability }))).await;
                     }
+                    actions.extend(state.on(Input::Turn(turn_event)));
                 }
+                actions
             }
-            transcript = transcripts.recv() => {
-                match transcript {
-                    Some(Transcript::Partial(text)) => {
-                        let _ = to_client.send(event(json!({ "type": "transcript", "text": text, "final": false }))).await;
-                    }
-                    Some(Transcript::Committed(text)) if commits_in_flight > 0 => {
-                        commits_in_flight -= 1;
-                        if !text.trim().is_empty() {
-                            if !turn_text.is_empty() {
-                                turn_text.push(' ');
-                            }
-                            turn_text.push_str(text.trim());
-                        }
-                    }
-                    Some(Transcript::Committed(_)) => {}
-                    Some(Transcript::Error(error)) => {
-                        let _ = to_client.send(event(json!({ "type": "error", "message": error }))).await;
-                    }
-                    None => anyhow::bail!("speech-to-text stream closed"),
+            transcript = transcripts.recv() => match transcript {
+                Some(Transcript::Partial(text)) => {
+                    let _ = to_client.send(event(json!({ "type": "transcript", "text": text, "final": false }))).await;
+                    continue;
                 }
+                Some(Transcript::Committed(text)) => state.on(Input::Committed(text)),
+                Some(Transcript::Error(error)) => {
+                    let _ = to_client.send(event(json!({ "type": "error", "message": error }))).await;
+                    continue;
+                }
+                None => anyhow::bail!("speech-to-text stream closed"),
+            },
+            Some(finished) = reply_done.recv() => {
+                if finished != generation {
+                    continue;
+                }
+                state.on(Input::ReplyFinished)
             }
             _ = unprompted.tick() => {
-                let busy = speaking.as_ref().is_some_and(|task| !task.0.is_finished());
-                if busy || turns.in_turn() || commits_in_flight > 0 || turn_ended_at.is_some() {
+                if !state.quiet() {
                     continue;
                 }
                 let Some(reply) = brain.unprompted().await? else { continue };
-                let (shared, to_client) = (shared.clone(), to_client.clone());
-                speaking = Some(AbortOnDrop(tokio::spawn(async move {
-                    let result = async { speak(reply, shared.elevenlabs.speaker().await?, &shared.speech, &to_client, None).await };
-                    report(result.await, &to_client).await;
-                })));
+                let actions = state.on(Input::UnpromptedReady);
+                if actions.contains(&Action::SpeakUnprompted) {
+                    generation += 1;
+                    let id = generation;
+                    let (shared, to_client, done) = (shared.clone(), to_client.clone(), reply_done_tx.clone());
+                    speaking = Some(AbortOnDrop(tokio::spawn(async move {
+                        let result = async { speak(reply, shared.elevenlabs.speaker().await?, &shared.speech, &to_client, None).await };
+                        report(result.await, &to_client).await;
+                        let _ = done.send(id).await;
+                    })));
+                }
+                continue;
+            }
+        };
+        for action in input {
+            match action {
+                Action::Commit => transcriber.commit().await?,
+                Action::Interrupt => {
+                    // Barge-in: stop speaking; the brain decides what
+                    // happens to the work behind that reply.
+                    speaking = None;
+                    let _ = to_client.send(event(json!({ "type": "interrupt" }))).await;
+                }
+                Action::TurnEnded(by) => {
+                    ended_at = Some(Instant::now());
+                    let _ = to_client
+                        .send(event(
+                            json!({ "type": "turn_end", "by": format!("{by:?}") }),
+                        ))
+                        .await;
+                }
+                Action::FinalTranscript(text) => {
+                    let _ = to_client
+                        .send(event(
+                            json!({ "type": "transcript", "text": text, "final": true }),
+                        ))
+                        .await;
+                }
+                Action::Reply { text, index } => {
+                    generation += 1;
+                    let id = generation;
+                    let (brain, shared, to_client, done) = (
+                        brain.clone(),
+                        shared.clone(),
+                        to_client.clone(),
+                        reply_done_tx.clone(),
+                    );
+                    let started = ended_at.take();
+                    let utterance = Utterance { text, index };
+                    // Replacing the previous reply aborts it.
+                    speaking = Some(AbortOnDrop(tokio::spawn(async move {
+                        let reply = async {
+                            let (speaker, reply) =
+                                tokio::join!(shared.elevenlabs.speaker(), brain.reply(utterance));
+                            speak(reply?, speaker?, &shared.speech, &to_client, started).await
+                        };
+                        report(reply.await, &to_client).await;
+                        let _ = done.send(id).await;
+                    })));
+                }
+                Action::SpeakUnprompted => {}
             }
         }
     }
