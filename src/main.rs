@@ -48,10 +48,16 @@ async fn main() -> Result<()> {
             )?,
             turn: TurnModel::spawn_threads(
                 &models.join("smart-turn-v3.2-cpu.onnx"),
-                env_or("CHIRP_TURN_THREADS", 2),
+                env_or(
+                    "CHIRP_TURN_THREADS",
+                    // Smart Turn is the throughput limit (~32 ms per decision);
+                    // VAD needs about one thread per 600 calls.
+                    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).max(1)),
+                ),
             )?,
             elevenlabs: ElevenLabs::from_env()?,
             speech: SpeechPolicy::default(),
+            turn_policy: chirp::turn_taking::Policy::default(),
         },
         http: reqwest::Client::new(),
         brain_url: std::env::var("CHIRP_BRAIN_URL")

@@ -56,3 +56,20 @@ numbers that matter, not a port.
 - **3. Hardening.** Doubling + soak + fuzz gates in CI; graceful drain on
   deploy; backpressure for slow clients.
 - **4. Adoption, then release** (only when the owner says so).
+
+## Findings log
+
+- **Batching Smart Turn doesn't help** (`turn_bench`): 31.6 ms per decision at
+  batch 1 and 32.6 at batch 16, one thread, M5 Pro. Profile (ORT 1.31):
+  QLinearMatMul 48%, QLinearSoftmax 15.5%, Erf (unfused GELU) 9.5%,
+  LayerNorm 7.6%. The matmuls already run ~107 GMAC/s; the fusible ~35% is
+  the only fat. Candidate: a fused pure-Rust encoder behind the parity test.
+- **Smart Turn is the throughput limit** (`bench_load`): 500 calls on 2 turn
+  threads answered 350 of ~1,500 turns; on 8 threads, all of them at flat
+  latency (p50 833 ms, p99 837 ms with 550 ms scripted), 10 ms CPU per
+  call-second. Thread count must follow load.
+- **Deciding the end of turn early trades quality for speed**
+  (`bench_turns`, Smart Turn v3.2 test set, English, 789 clips): ending at 2
+  quiet windows when p >= 0.9 decides ~125 ms sooner than the baseline but
+  raises cut-offs (a turn ended, then the speaker kept talking) from 52% to
+  60% on human speech. So: keep the decision, speculate the work.

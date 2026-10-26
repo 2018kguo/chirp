@@ -31,6 +31,12 @@ pub struct Script {
     pub reply_words: usize,
     /// First text → first audio.
     pub tts_first_audio: Duration,
+    /// Between 100 ms audio chunks: TTS streams about twice as fast as
+    /// speech, so a long reply is still arriving when a caller cuts in.
+    pub tts_chunk_gap: Duration,
+    /// Drop the transcription connection this long after a committed
+    /// transcript, as a failing provider would.
+    pub stt_drop_after_commit: Option<Duration>,
 }
 
 impl Default for Script {
@@ -42,6 +48,8 @@ impl Default for Script {
             brain_token_gap: Duration::from_millis(10),
             reply_words: 20,
             tts_first_audio: Duration::from_millis(150),
+            tts_chunk_gap: Duration::from_millis(50),
+            stt_drop_after_commit: None,
         }
     }
 }
@@ -104,13 +112,23 @@ async fn stt(State(script): State<Script>, upgrade: WebSocketUpgrade) -> impl In
     upgrade.on_upgrade(move |socket| async move {
         let (send, mut stream) = outbox(socket);
         let _ = send.send(json!({ "message_type": "session_started" }));
-        while let Some(Ok(Message::Text(text))) = stream.next().await {
+        let (dropped, mut drop_now) = mpsc::unbounded_channel::<()>();
+        loop {
+            let message = tokio::select! {
+                message = stream.next() => message,
+                _ = drop_now.recv() => break, // dropping both halves closes the connection
+            };
+            let Some(Ok(Message::Text(text))) = message else { break };
             let Ok(message) = serde_json::from_str::<Value>(&text) else { continue };
             if message["commit"] == true {
-                let (send, script) = (send.clone(), script.clone());
+                let (send, script, dropped) = (send.clone(), script.clone(), dropped.clone());
                 tokio::spawn(async move {
                     tokio::time::sleep(script.stt_commit).await;
                     let _ = send.send(json!({ "message_type": "committed_transcript", "text": script.transcript }));
+                    if let Some(after) = script.stt_drop_after_commit {
+                        tokio::time::sleep(after).await;
+                        let _ = dropped.send(());
+                    }
                 });
             }
         }
@@ -120,27 +138,43 @@ async fn stt(State(script): State<Script>, upgrade: WebSocketUpgrade) -> impl In
 async fn tts(State(script): State<Script>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
     upgrade.on_upgrade(move |socket| async move {
         let (send, mut stream) = outbox(socket);
-        // 100 ms of 16 kHz PCM16 per text message: enough to be audio, cheap to make.
-        let chunk = BASE64.encode(vec![0u8; 3_200]);
-        let mut first = true;
+        // Text is read as it comes; audio is paced out by its own task.
+        let (text_in, mut text_out) = mpsc::unbounded_channel::<bool>();
+        let pacer = tokio::spawn(async move {
+            // 100 ms of 16 kHz PCM16 per text message: audio, cheap to make.
+            let chunk = BASE64.encode(vec![0u8; 3_200]);
+            let mut first = true;
+            while let Some(more) = text_out.recv().await {
+                if !more {
+                    let _ = send.send(json!({ "isFinal": true }));
+                    break;
+                }
+                tokio::time::sleep(if first {
+                    script.tts_first_audio
+                } else {
+                    script.tts_chunk_gap
+                })
+                .await;
+                first = false;
+                let _ = send.send(json!({ "audio": chunk }));
+            }
+        });
         while let Some(Ok(Message::Text(text))) = stream.next().await {
             let Ok(message) = serde_json::from_str::<Value>(&text) else {
                 continue;
             };
-            let words = message["text"].as_str().unwrap_or_default().to_string();
+            let words = message["text"].as_str().unwrap_or_default();
             if words.is_empty() {
-                let _ = send.send(json!({ "isFinal": true }));
+                let _ = text_in.send(false);
                 break;
             }
-            if words.trim().is_empty() {
-                continue; // the stream's opening " "
+            if !words.trim().is_empty() {
+                let _ = text_in.send(true); // the stream's opening " " is not speech
             }
-            if first {
-                first = false;
-                tokio::time::sleep(script.tts_first_audio).await;
-            }
-            let _ = send.send(json!({ "audio": chunk }));
         }
+        // The caller closed early (barge-in): stop producing audio.
+        drop(text_in);
+        let _ = pacer.await;
     })
 }
 

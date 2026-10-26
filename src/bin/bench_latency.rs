@@ -77,6 +77,7 @@ async fn main() -> Result<()> {
             base_url: format!("ws://{mocks}"),
         },
         speech: SpeechPolicy::default(),
+        turn_policy: chirp::turn_taking::Policy::default(),
     };
     let http = reqwest::Client::new();
     let brain_url = format!("http://{mocks}/v1");

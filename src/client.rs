@@ -14,7 +14,12 @@ pub struct Outcome {
     /// JSON events with their arrival times.
     pub events: Vec<(Duration, Value)>,
     pub first_audio: Option<Duration>,
+    /// Arrival time of every audio message.
+    pub audio_at: Vec<Duration>,
     pub audio: Vec<i16>,
+    /// When the caller hung up, and when the server closed the connection.
+    pub hung_up: Duration,
+    pub closed: Duration,
 }
 
 impl Outcome {
@@ -29,17 +34,23 @@ impl Outcome {
 
 /// Plays `speech`, then `tail` of silence, then hangs up.
 pub async fn call(url: &str, speech: &[i16], tail: Duration) -> Result<Outcome> {
+    let mut audio = speech.to_vec();
+    audio.extend(std::iter::repeat_n(0i16, (tail.as_millis() * 16) as usize));
+    let mut outcome = play(url, audio).await?;
+    outcome.speech_end = speech_end(speech);
+    Ok(outcome)
+}
+
+/// Plays `audio` at real-time pace, hangs up, and waits for the server to
+/// close the connection.
+pub async fn play(url: &str, audio: Vec<i16>) -> Result<Outcome> {
     let (socket, _) = tokio_tungstenite::connect_async(url)
         .await
         .context("connect")?;
     let (mut sink, mut stream) = socket.split();
-    let silence = [0i16; 320];
-    let frames: Vec<Vec<u8>> = speech
+    let speech_end = speech_end(&audio);
+    let frames: Vec<Vec<u8>> = audio
         .chunks(320)
-        .chain(std::iter::repeat_n(
-            &silence[..],
-            (tail.as_millis() / 20) as usize,
-        ))
         .map(|frame| frame.iter().flat_map(|s| s.to_le_bytes()).collect())
         .collect();
     let started = Instant::now();
@@ -51,19 +62,25 @@ pub async fn call(url: &str, speech: &[i16], tail: Duration) -> Result<Outcome> 
                 break;
             }
         }
+        let hung_up = started.elapsed();
         let _ = sink.close().await;
+        hung_up
     });
     let mut outcome = Outcome {
-        speech_end: speech_end(speech),
+        speech_end,
         events: Vec::new(),
         first_audio: None,
+        audio_at: Vec::new(),
         audio: Vec::new(),
+        hung_up: Duration::ZERO,
+        closed: Duration::ZERO,
     };
     while let Some(Ok(message)) = stream.next().await {
         let at = started.elapsed();
         match message {
             Message::Binary(pcm) => {
                 outcome.first_audio.get_or_insert(at);
+                outcome.audio_at.push(at);
                 outcome.audio.extend(
                     pcm.chunks_exact(2)
                         .map(|b| i16::from_le_bytes([b[0], b[1]])),
@@ -77,7 +94,8 @@ pub async fn call(url: &str, speech: &[i16], tail: Duration) -> Result<Outcome> 
             _ => {}
         }
     }
-    sender.abort();
+    outcome.closed = started.elapsed();
+    outcome.hung_up = sender.await.unwrap_or_default();
     Ok(outcome)
 }
 

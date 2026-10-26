@@ -30,7 +30,7 @@ const STATE: usize = 2 * 128;
 const MAX_BATCH: usize = 256;
 
 /// Pipecat `VADParams` defaults.
-const CONFIDENCE: f32 = 0.7;
+pub const CONFIDENCE: f32 = 0.7;
 const START_WINDOWS: u32 = 6; // round(0.2 s / 32 ms)
 const STOP_WINDOWS: u32 = 6;
 /// Pipecat's model reset: after 2 s of audio, on a clearly quiet stretch.

@@ -19,4 +19,5 @@ pub mod ring;
 pub mod server;
 pub mod sse;
 pub mod turn;
+pub mod turn_taking;
 pub mod vad;
