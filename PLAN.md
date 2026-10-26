@@ -97,3 +97,13 @@ numbers that matter, not a port.
   (185 MB at 200 calls); glibc MALLOC_ARENA_MAX=2 187 KB (176 MB); mimalloc
   153 KB but +70 MB baseline (247 MB); jemalloc 133 KB (179 MB). jemalloc is
   now the Linux default. CPU and latency equal across all four.
+- **Rejected: VAD state in a per-call slot, 1 KB requests** (instead of
+  3.3 KB through the queue). Interleaved A/B at 400 calls: no difference
+  (CPU 8.95–9.38 vs 9.04–9.91 ms per call-second; same latency). At 1,000
+  calls on a machine already loaded by other work it lost both rounds
+  (p99 ~3.0 s vs 1.0–1.9 s); plausible cause: the VAD thread holds a call's
+  std mutex during gather/scatter while that call's task locks it from async
+  code, so a descheduled VAD thread can block a whole tokio worker. Reverted.
+- **Noise floor:** with the host at load ~11–18 from other work, 1,000-call
+  runs saturate and their latency varies by 2–3x between runs; compare
+  builds interleaved, and below saturation for small effects.
