@@ -43,7 +43,8 @@ impl Default for Policy {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TurnEvent {
-    /// The caller started speaking (a barge-in, if the call is talking).
+    /// The caller started speaking (a barge-in, if the call is talking), or
+    /// spoke again after a `Paused`: speech the turn hasn't committed yet.
     SpeechStarted,
     /// The caller went quiet mid-turn; the turn may be ending. Fires once per
     /// pause, a few windows in.
@@ -164,6 +165,9 @@ impl TurnTaker {
         if self.vad.speaking() {
             self.quiet = if quiet { self.quiet + 1 } else { 0 };
             if !quiet {
+                if self.pause_reported {
+                    events.push(TurnEvent::SpeechStarted);
+                }
                 self.pause_reported = false;
             }
             let after = self.policy.pause_after_quiet_windows;

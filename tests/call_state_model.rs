@@ -46,8 +46,22 @@ fn moves(world: &World) -> Vec<(Input, Caller, bool)> {
     let turn = |event| Input::Turn(event);
     match world.caller {
         Idle => next.push((turn(TurnEvent::SpeechStarted), Speaking, true)),
-        Speaking => next.push((turn(TurnEvent::Paused), Paused, false)),
+        // The VAD can also call the pause before a `Paused` (reporting off,
+        // or set later than the VAD's stop).
+        Speaking => {
+            next.push((turn(TurnEvent::Paused), Paused, false));
+            next.push((
+                turn(TurnEvent::Ended {
+                    by: EndedBy::Fallback,
+                }),
+                Idle,
+                false,
+            ));
+            next.push((turn(TurnEvent::Assessed { probability: 0.2 }), Grace, false));
+        }
         Paused => {
+            // Speaking again before the VAD calls the pause.
+            next.push((turn(TurnEvent::SpeechStarted), Speaking, true));
             next.push((turn(TurnEvent::Ended { by: EndedBy::Model }), Idle, false));
             next.push((turn(TurnEvent::Assessed { probability: 0.2 }), Grace, false));
         }
@@ -64,15 +78,6 @@ fn moves(world: &World) -> Vec<(Input, Caller, bool)> {
     }
     next.push((Input::UnpromptedReady, world.caller, false));
     next
-}
-
-/// Paused can also resume without an event: modelled as Paused → Speaking.
-fn resume(world: &World) -> Option<World> {
-    (world.caller == Caller::Paused).then(|| World {
-        caller: Caller::Speaking,
-        unsent: true,
-        ..world.clone()
-    })
 }
 
 fn step(world: &World, input: Input, caller: Caller, speech_starts: bool) -> Result<World, String> {
@@ -161,9 +166,6 @@ fn every_interleaving_keeps_the_invariants() {
         let mut next_frontier = Vec::new();
         for (world, trace) in frontier {
             let mut successors: Vec<(World, String)> = Vec::new();
-            if let Some(resumed) = resume(&world) {
-                successors.push((resumed, "resume".into()));
-            }
             for (input, caller, speech_starts) in moves(&world) {
                 let label = format!("{input:?}");
                 match step(&world, input, caller, speech_starts) {
