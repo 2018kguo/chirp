@@ -203,6 +203,7 @@ dependencies = [
  "dhat",
  "futures",
  "hound",
+ "libc",
  "mimalloc",
  "ort",
  "reqwest",

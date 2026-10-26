@@ -16,6 +16,7 @@ dhat-heap = ["dep:dhat"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
+libc = "0.2"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"

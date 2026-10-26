@@ -128,6 +128,16 @@ async fn converse(
     let mut latencies = Vec::new();
     let mut answered = u64::MAX;
     while let Some(Ok(message)) = stream.next().await {
+        if let Message::Text(text) = &message {
+            // chirp reports what went wrong on a call (a provider failing to
+            // connect, say): a failed call, not a quiet one.
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(text) {
+                if event["type"] == "error" {
+                    anyhow::bail!("error event: {}", event["message"]);
+                }
+            }
+            continue;
+        }
         if !matches!(message, Message::Binary(_)) {
             continue;
         }
@@ -149,6 +159,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    chirp::raise_fd_limit();
     let args: Vec<String> = std::env::args().collect();
     let engine = args.get(1).map_or("chirp", String::as_str).to_string();
     let calls: usize = args.get(2).map_or(10, |a| a.parse().unwrap());

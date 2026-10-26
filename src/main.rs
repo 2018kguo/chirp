@@ -60,6 +60,7 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    chirp::raise_fd_limit();
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
     tracing_subscriber::fmt()
@@ -70,20 +71,22 @@ async fn main() -> Result<()> {
         std::env::var("CHIRP_MODELS_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/models").into()),
     );
+    // Threads that have nothing to do cost nothing; too few cap the box.
+    // On a 16-vCPU c7a, half the cores for Smart Turn refused 388 of 1,000
+    // calls; all but two served all 1,000 (PLAN.md).
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let app = App {
         shared: Shared {
             vad: VadModel::spawn_threads(
                 &models.join("silero_vad.onnx"),
-                env_or("CHIRP_VAD_THREADS", 2),
+                // ~1 core per 1,000 calls, but 2 threads ran at their limit
+                // there (p99 frame wait 23 ms vs 5.5 ms with 4).
+                env_or("CHIRP_VAD_THREADS", (cores / 4).max(2)),
             )?,
             turn: TurnModel::spawn_threads(
                 &models.join("smart-turn-v3.2-cpu.onnx"),
-                env_or(
-                    "CHIRP_TURN_THREADS",
-                    // Smart Turn is the throughput limit (~32 ms per decision);
-                    // VAD needs about one thread per 600 calls.
-                    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).max(1)),
-                ),
+                // Smart Turn is the throughput limit (~38 ms per decision on a c7a).
+                env_or("CHIRP_TURN_THREADS", cores.saturating_sub(2).max(1)),
             )?,
             elevenlabs: ElevenLabs::from_env()?,
             speech: SpeechPolicy::default(),

@@ -117,3 +117,31 @@ numbers that matter, not a port.
 - **Benchmarking policy:** no load tests at scale on the owner's laptop.
   Local: ≤50 calls, short, niced; single-thread microbenchmarks and
   profiles. Scale curves go to remote hardware.
+- **Production CPU, AWS c7a.4xlarge (16 vCPU, EPYC 9R14), Oct 26 2026.**
+  Engine latency on the mocks: chirp 182 ms vs Pipecat 315 ms (medians,
+  n=30 each, CIs ±1 ms). Smart Turn: 38 ms per decision on one thread
+  (Pipecat publishes 9 ms int8 on c7a; thread count unverified).
+  Load, 30 s, real audio, mocks on the same box:
+
+  | Engine | Calls | Cores | CPU ms per call-s | Failed | p50 / p99 ms |
+  |---|---|---|---|---|---|
+  | chirp | 500 | 5.9 | 11.8 | 0 | 734 / 741 |
+  | chirp | 1,000 | 12.6 | 12.6 | 0 | 777 / 890 |
+  | chirp | 1,500 | 10.2 | 6.8 | 605 refused (503) | 986 / 1,235 |
+  | Pipecat | 50 | 4.6 | 91.6 | 0 | 454 / 2,686 |
+  | Pipecat | 100 | 1.2 | 11.9 | 0 turns completed | — |
+
+  Pipecat ran before the fd-limit fix below; rerun it before quoting.
+  Capacity on this box is ~1,000 calls, bound by Smart Turn CPU.
+- **Three silent caps found on Linux, each invisible on macOS:**
+  1. The open-file soft limit (1,024): past ~300 calls, reply connections
+     failed and calls went unanswered (550 turns of ~2,500 at 500 calls).
+     chirp now raises its soft limit to the hard limit at startup, and
+     bench_load fails a call on any `error` event instead of ignoring it.
+  2. Thread defaults: half the cores for Smart Turn refused 388 of 1,000
+     calls. Now all but two cores for Smart Turn and a quarter (min 2) for
+     the VAD. Two VAD threads ran at their limit at 1,000 calls (p99 frame
+     wait 23 ms vs 5.5 ms with 4, same CPU).
+  3. bench_load's `kill -KILL -<pgid>`: procps-ng 4.0.4 reads it as every
+     process the user owns while the group is alive, killing the benchmark
+     suite and its SSH session. Now `kill -s KILL -- -<pgid>`.
