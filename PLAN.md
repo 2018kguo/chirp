@@ -176,3 +176,19 @@ numbers that matter, not a port.
   flipped: rejected. Smart Turn is at onnxruntime's floor here; what is
   left is QLinearSoftmax (~20% of a decision, onnxruntime's per-row
   std::function) and the attention U8U8 matmuls.
+- **Rejected: HTTP/2 to the brain.** Against api.openai.com (reqwest 0.12,
+  ALPN): 20 concurrent requests on a warm client open 1 connection over
+  HTTP/2 vs 20 over HTTP/1.1; cold, both open 20 (none knows it may share
+  until ALPN completes). But OpenAI advertises max_concurrent_streams 100,
+  and hyper queues past it: 300 concurrent requests still used 1
+  connection. At 1,000 calls ~200-500 replies stream at once, so most would
+  wait for a slot, and one dropped connection would fail them all.
+  HTTP/1.1 keep-alive already reuses idle connections (no handshake per
+  reply); it only costs a socket per concurrent reply.
+- **Skipped: a pool of pre-opened TTS connections.** `speaker()` already
+  connects in parallel with the brain's first token (`tokio::join!`), so
+  the 86-172 ms connect is off the critical path whenever the brain's first
+  token takes longer; and a stream-input connection ends with its reply, so
+  a spare pool would still handshake once per reply. Multi-context TTS
+  would save the handshake (~1 ms CPU each, ~1.5% of CPU at 1,000 calls)
+  at the price of shared fate across calls: not worth it.

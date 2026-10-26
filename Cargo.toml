@@ -31,6 +31,9 @@ reqwest = { version = "0.12", default-features = false, features = [
   "json",
   "stream",
   "rustls-tls",
+  # No "http2": OpenAI caps a connection at 100 streams and hyper queues
+  # requests past that instead of opening another connection, so replies at
+  # scale would wait in line. HTTP/1.1 keep-alive already reuses connections.
 ] }
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
