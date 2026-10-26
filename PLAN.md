@@ -128,10 +128,19 @@ numbers that matter, not a port.
   | chirp | 500 | 5.9 | 11.8 | 0 | 734 / 741 |
   | chirp | 1,000 | 12.6 | 12.6 | 0 | 777 / 890 |
   | chirp | 1,500 | 10.2 | 6.8 | 605 refused (503) | 986 / 1,235 |
-  | Pipecat | 50 | 4.6 | 91.6 | 0 | 454 / 2,686 |
-  | Pipecat | 100 | 1.2 | 11.9 | 0 turns completed | — |
+  | chirp | 10 | 0.13 | 13.2 | 0 | 731 / 737 |
+  | chirp | 25 | 0.33 | 13.2 | 0 | 731 / 753 |
+  | Pipecat | 10 | 3.1 | 312 | 0 (40 of ~50 turns) | 871 / 885 |
+  | Pipecat | 25 | 7.6 | 302 | 0 (83 of ~125 turns) | 1,299 / 2,635 |
+  | Pipecat | 50 / 100 | — | — | 28 / 0 turns completed | — |
 
-  Pipecat ran before the fd-limit fix below; rerun it before quoting.
+  Pipecat runs every call in one uvicorn process with a Silero session per
+  call; its event loop falls behind from 10 calls on this box, so its CPU
+  per call-second is a floor. Rerun after the fd-limit fix: unchanged.
+  Python onnxruntime 1.24.4 times Smart Turn at 37.5 ms on one thread
+  (chirp: 38.4), 21.5 ms on 4, 14.6 ms with its default threads: Pipecat's
+  9 ms is a many-thread number; one thread per decision is the throughput
+  optimum, and chirp's kernels are at onnxruntime parity.
   Capacity on this box is ~1,000 calls, bound by Smart Turn CPU.
 - **Three silent caps found on Linux, each invisible on macOS:**
   1. The open-file soft limit (1,024): past ~300 calls, reply connections
@@ -145,3 +154,16 @@ numbers that matter, not a port.
   3. bench_load's `kill -KILL -<pgid>`: procps-ng 4.0.4 reads it as every
      process the user owns while the group is alive, killing the benchmark
      suite and its SSH session. Now `kill -s KILL -- -<pgid>`.
+- **CPU profile at 500 calls (c7a, perf, 15 s):** chirp's own code ~3%
+  (mel 1.3%, call loop 0.8%, ring 0.4%); kernel networking 12.5%; the rest
+  onnxruntime: int8 GEMM `MlasGemmU8X8KernelAvx512Core` 27.4%,
+  QLinearSoftmax 12.0%, fp32 GEMM 10.5%, requantize 3.1%. The GEMMs run
+  U8U8 (unsigned weights in the published model), which cannot use VNNI
+  (`vpdpbusd` is u8 x s8); the convs already take the VNNI kernel.
+- **Rejected: dynamic U8S8 requantization** of the fp32 model
+  (`smart-turn-v3.2-gpu.onnx`, value_info stripped): 48.8 ms vs 37.5 ms
+  for the published static U8U8, one thread (fp32: 74.0 ms); per-channel
+  the same. Closer to fp32's output, but a DynamicQuantizeLinear per matmul
+  and fp32 softmax cost more than VNNI saves. **Next lever:** static QDQ
+  U8S8 calibrated on held-out audio (not the test set), scored on
+  bench_turns for unchanged verdicts.
