@@ -86,3 +86,9 @@ numbers that matter, not a port.
   warmed at startup: arenas exist before the first call, and p99 at 1,000
   calls fell from 975–1,649 ms to 740 ms (cold sessions had paid their first
   run on some caller's pause).
+- **TLS config per connection was the biggest production cost the mocks
+  hid**: tokio-tungstenite builds a fresh rustls config (root certificates
+  loaded and parsed, ~74 ms CPU on macOS) for every connection, and chirp
+  connects per call (STT) and per reply (TTS). One shared config: live
+  ElevenLabs connects 182–322 ms → 86–172 ms (`tests/live_elevenlabs.rs`,
+  `--ignored`). Sockets also skip Nagle now (small audio writes).

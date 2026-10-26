@@ -8,12 +8,16 @@ use bytes::BytesMut;
 use futures::stream::{SplitSink, StreamExt};
 use futures::SinkExt;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
-use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
+
+use tokio_tungstenite::{
+    connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
+};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -25,20 +29,43 @@ pub struct ElevenLabs {
     pub stt_model: String,
     /// `wss://api.elevenlabs.io` in production; a local mock in benchmarks.
     pub base_url: String,
+    /// Built once per process and shared by every connection: without it,
+    /// each connection loads and parses the system's root certificates
+    /// (~74 ms of CPU on macOS) and keeps its own TLS config, and no
+    /// connection can resume a previous session.
+    tls: Arc<rustls::ClientConfig>,
 }
 
 impl ElevenLabs {
-    pub fn from_env() -> Result<Self> {
+    pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Result<Self> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         Ok(Self {
-            api_key: std::env::var("ELEVENLABS_API_KEY").context("ELEVENLABS_API_KEY")?,
-            voice_id: std::env::var("ELEVENLABS_VOICE_ID")
-                .unwrap_or_else(|_| "21m00Tcm4TlvDq8ikWAM".into()),
-            tts_model: std::env::var("ELEVENLABS_TTS_MODEL")
-                .unwrap_or_else(|_| "eleven_flash_v2_5".into()),
+            api_key: api_key.into(),
+            voice_id: "21m00Tcm4TlvDq8ikWAM".into(),
+            tts_model: "eleven_flash_v2_5".into(),
             stt_model: "scribe_v2_realtime".into(),
-            base_url: std::env::var("ELEVENLABS_BASE_URL")
-                .unwrap_or_else(|_| "wss://api.elevenlabs.io".into()),
+            base_url: base_url.into(),
+            tls: Arc::new(tls),
         })
+    }
+
+    pub fn from_env() -> Result<Self> {
+        let mut elevenlabs = Self::new(
+            std::env::var("ELEVENLABS_API_KEY").context("ELEVENLABS_API_KEY")?,
+            std::env::var("ELEVENLABS_BASE_URL")
+                .unwrap_or_else(|_| "wss://api.elevenlabs.io".into()),
+        )?;
+        if let Ok(voice) = std::env::var("ELEVENLABS_VOICE_ID") {
+            elevenlabs.voice_id = voice;
+        }
+        if let Ok(model) = std::env::var("ELEVENLABS_TTS_MODEL") {
+            elevenlabs.tts_model = model;
+        }
+        Ok(elevenlabs)
     }
 
     async fn open(&self, path_and_query: &str) -> Result<Socket> {
@@ -51,9 +78,12 @@ impl ElevenLabs {
         let config = WebSocketConfig::default()
             .read_buffer_size(8 * 1024)
             .write_buffer_size(0);
-        let (socket, _) = connect_async_with_config(request, Some(config), false)
-            .await
-            .context("ElevenLabs connect")?;
+        // No Nagle: audio and transcripts are small writes that must leave now.
+        let connector = Connector::Rustls(self.tls.clone());
+        let (socket, _) =
+            connect_async_tls_with_config(request, Some(config), true, Some(connector))
+                .await
+                .context("ElevenLabs connect")?;
         Ok(socket)
     }
 

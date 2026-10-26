@@ -69,13 +69,7 @@ async fn main() -> Result<()> {
     let shared = Shared {
         vad: VadModel::spawn_threads(&root.join("models/silero_vad.onnx"), 2)?,
         turn: TurnModel::spawn_threads(&root.join("models/smart-turn-v3.2-cpu.onnx"), 2)?,
-        elevenlabs: ElevenLabs {
-            api_key: "mock".into(),
-            voice_id: "mock".into(),
-            tts_model: "mock".into(),
-            stt_model: "mock".into(),
-            base_url: format!("ws://{mocks}"),
-        },
+        elevenlabs: ElevenLabs::new("mock", format!("ws://{mocks}"))?,
         speech: SpeechPolicy::default(),
         turn_policy: chirp::turn_taking::Policy::default(),
     };
@@ -86,7 +80,7 @@ async fn main() -> Result<()> {
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("ws://{}/v1/calls", listener.local_addr()?);
-    tokio::spawn(async move { axum::serve(listener, router).await });
+    tokio::spawn(async move { axum::serve(chirp::server::nodelay(listener), router).await });
 
     // The reference: Pipecat on the same mocks, as a subprocess.
     let pipecat_port = std::net::TcpListener::bind("127.0.0.1:0")?

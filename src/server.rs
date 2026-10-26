@@ -41,3 +41,14 @@ where
         )
         .with_state(shared)
 }
+
+/// A listener whose connections send small writes at once (no Nagle): a
+/// call's audio leaves in 640-byte frames every 20 ms.
+pub fn nodelay(
+    listener: tokio::net::TcpListener,
+) -> impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = std::net::SocketAddr> {
+    use axum::serve::ListenerExt;
+    listener.tap_io(|connection| {
+        let _ = connection.set_nodelay(true);
+    })
+}

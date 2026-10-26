@@ -114,7 +114,8 @@ async fn main() -> Result<()> {
             signal.recv().await;
         }
     };
-    axum::serve(tokio::net::TcpListener::bind(address).await?, router)
+    let listener = chirp::server::nodelay(tokio::net::TcpListener::bind(address).await?);
+    axum::serve(listener, router)
         .with_graceful_shutdown(terminate)
         .await?;
     Ok(())

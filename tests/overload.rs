@@ -23,13 +23,7 @@ async fn overloaded_calls_degrade_and_close_promptly() {
         vad: VadModel::spawn_threads(&root.join("models/silero_vad.onnx"), 2).unwrap(),
         // One thread for 120 simultaneous pauses: ~3.8 s of queued decisions.
         turn: TurnModel::spawn_threads(&root.join("models/smart-turn-v3.2-cpu.onnx"), 1).unwrap(),
-        elevenlabs: ElevenLabs {
-            api_key: "mock".into(),
-            voice_id: "mock".into(),
-            tts_model: "mock".into(),
-            stt_model: "mock".into(),
-            base_url: format!("ws://{mocks}"),
-        },
+        elevenlabs: ElevenLabs::new("mock", format!("ws://{mocks}")).unwrap(),
         speech: SpeechPolicy::default(),
         turn_policy: Policy::default(),
     };
@@ -41,7 +35,7 @@ async fn overloaded_calls_degrade_and_close_promptly() {
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, router).await });
+    tokio::spawn(async move { axum::serve(chirp::server::nodelay(listener), router).await });
     let url = format!("ws://{address}/v1/calls");
 
     let mut audio =

@@ -23,13 +23,7 @@ async fn chirp_on(script: Script) -> String {
     let shared = Shared {
         vad: VadModel::spawn(&root().join("models/silero_vad.onnx")).unwrap(),
         turn: TurnModel::spawn_threads(&root().join("models/smart-turn-v3.2-cpu.onnx"), 1).unwrap(),
-        elevenlabs: ElevenLabs {
-            api_key: "mock".into(),
-            voice_id: "mock".into(),
-            tts_model: "mock".into(),
-            stt_model: "mock".into(),
-            base_url: format!("ws://{mocks}"),
-        },
+        elevenlabs: ElevenLabs::new("mock", format!("ws://{mocks}")).unwrap(),
         speech: SpeechPolicy::default(),
         turn_policy: Policy::default(),
     };
@@ -40,7 +34,7 @@ async fn chirp_on(script: Script) -> String {
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/v1/calls", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, router).await });
+    tokio::spawn(async move { axum::serve(chirp::server::nodelay(listener), router).await });
     url
 }
 
