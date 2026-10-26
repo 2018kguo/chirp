@@ -60,6 +60,8 @@ pub enum EndedBy {
     Model,
     /// Silence for the whole grace period after an "unfinished" verdict.
     Grace,
+    /// The VAD's pause alone: Smart Turn was too busy to answer in time.
+    Fallback,
 }
 
 pub struct TurnTaker {
@@ -137,13 +139,19 @@ impl TurnTaker {
                 return Ok(());
             }
             Some(Speech::Stopped) => {
-                let probability = self.assess(events).await?;
-                if probability > self.policy.complete {
-                    self.end(EndedBy::Model, events);
-                } else {
-                    self.grace_until = Some(
-                        self.clock + (self.policy.grace.as_secs_f64() * SAMPLE_RATE as f64) as u64,
-                    );
+                match self.assess(events).await? {
+                    Some(probability) if probability > self.policy.complete => {
+                        self.end(EndedBy::Model, events)
+                    }
+                    // No verdict in time: the VAD's call stands, as in engines
+                    // without an end-of-turn model.
+                    None => self.end(EndedBy::Fallback, events),
+                    Some(_) => {
+                        self.grace_until = Some(
+                            self.clock
+                                + (self.policy.grace.as_secs_f64() * SAMPLE_RATE as f64) as u64,
+                        );
+                    }
                 }
                 return Ok(());
             }
@@ -166,9 +174,13 @@ impl TurnTaker {
         Ok(())
     }
 
-    async fn assess(&mut self, events: &mut Vec<TurnEvent>) -> Result<f32> {
+    /// Smart Turn's verdict on the current turn, or `None` if the pool could
+    /// not answer in time (overload).
+    async fn assess(&mut self, events: &mut Vec<TurnEvent>) -> Result<Option<f32>> {
         let probability = self.turn.complete(self.turn_audio.to_vec()).await?;
-        events.push(TurnEvent::Assessed { probability });
+        if let Some(probability) = probability {
+            events.push(TurnEvent::Assessed { probability });
+        }
         Ok(probability)
     }
 

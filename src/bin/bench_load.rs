@@ -34,7 +34,7 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         let _ = Command::new("kill")
-            .args(["-TERM", &format!("-{}", self.0.id())])
+            .args(["-KILL", &format!("-{}", self.0.id())])
             .status();
         let _ = self.0.wait();
     }

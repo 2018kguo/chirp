@@ -22,6 +22,11 @@ where
                 move |State(shared): State<Shared>, upgrade: WebSocketUpgrade| {
                     let brain = make_brain();
                     async move {
+                        // Behind already: a new call would make every call worse.
+                        if shared.turn.overloaded() {
+                            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "at capacity")
+                                .into_response();
+                        }
                         upgrade
                             .on_upgrade(move |socket| call::run(socket, shared, brain))
                             .into_response()
