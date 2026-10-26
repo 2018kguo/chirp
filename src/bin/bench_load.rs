@@ -45,7 +45,9 @@ impl Drop for Process {
             std::thread::sleep(Duration::from_millis(100));
         }
         let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{}", self.0.id())])
+            // `--`: procps-ng 4.0.4 reads `kill -KILL -<pgid>` as "every process
+            // you own" while the group is alive (it took the shell running it).
+            .args(["-s", "KILL", "--", &format!("-{}", self.0.id())])
             .status();
         let _ = self.0.wait();
     }
