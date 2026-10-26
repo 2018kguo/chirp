@@ -152,7 +152,12 @@ async fn main() -> Result<()> {
     let calls: usize = args.get(2).map_or(10, |a| a.parse().unwrap());
     let seconds: u64 = args.get(3).map_or(30, |a| a.parse().unwrap());
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let release = root.join("target/release");
+    // Sibling binaries live next to this one (also in a container whose
+    // target directory is not the crate's).
+    let release = std::env::current_exe()?
+        .parent()
+        .context("bench_load's directory")?
+        .to_path_buf();
 
     let mocks_port = free_port()?;
     let _mocks = Process::spawn(
@@ -168,7 +173,10 @@ async fn main() -> Result<()> {
     )?;
     let mut command = match engine.as_str() {
         "chirp" => {
-            let mut command = Command::new(release.join("chirp"));
+            // CHIRP_BIN: another build of the server (allocator experiments).
+            let binary = std::env::var_os("CHIRP_BIN")
+                .map_or_else(|| release.join("chirp"), std::path::PathBuf::from);
+            let mut command = Command::new(binary);
             command
                 .env("PORT", port.to_string())
                 .env("ELEVENLABS_BASE_URL", format!("ws://{mocks}"))
@@ -206,8 +214,11 @@ async fn main() -> Result<()> {
     };
     let server = Process::spawn(command.stdout(Stdio::null()).stderr(log))?;
     wait_for(port).await?;
-    // `uv run` is a parent of the Python process; measure the listener itself.
-    let pid = {
+    // chirp is the process we spawned; for Pipecat, `uv run` is a parent of
+    // the Python process, so measure whatever listens on the port.
+    let pid = if engine == "chirp" {
+        server.0.id()
+    } else {
         let out = Command::new("lsof")
             .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
             .output()?;

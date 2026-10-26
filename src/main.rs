@@ -23,21 +23,33 @@ struct App {
     system_prompt: Option<String>,
 }
 
+// The allocator: jemalloc on Linux (measured lowest RSS per call), the
+// system's elsewhere, mimalloc by feature; dhat or a live-byte counter
+// (wrapping the chosen one) for measurements.
 #[cfg(feature = "mimalloc")]
-#[global_allocator]
-static MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-#[cfg(feature = "jemalloc")]
-#[global_allocator]
-static JEMALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static DHAT: dhat::Alloc = dhat::Alloc;
+type Allocator = mimalloc::MiMalloc;
+#[cfg(feature = "mimalloc")]
+const ALLOCATOR: Allocator = mimalloc::MiMalloc;
+#[cfg(all(target_os = "linux", not(feature = "mimalloc")))]
+type Allocator = tikv_jemallocator::Jemalloc;
+#[cfg(all(target_os = "linux", not(feature = "mimalloc")))]
+const ALLOCATOR: Allocator = tikv_jemallocator::Jemalloc;
+#[cfg(not(any(target_os = "linux", feature = "mimalloc")))]
+type Allocator = std::alloc::System;
+#[cfg(not(any(target_os = "linux", feature = "mimalloc")))]
+const ALLOCATOR: Allocator = std::alloc::System;
 
 #[cfg(feature = "heap-stats")]
 #[global_allocator]
-static ALLOCATOR: chirp::heap::Counting = chirp::heap::Counting;
+static GLOBAL: chirp::heap::Counting<Allocator> = chirp::heap::Counting(ALLOCATOR);
+
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
+
+#[cfg(not(any(feature = "heap-stats", feature = "dhat-heap")))]
+#[global_allocator]
+static GLOBAL: Allocator = ALLOCATOR;
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)

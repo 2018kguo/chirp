@@ -12,9 +12,8 @@ description = "A voice engine that serves many calls per process"
 heap-stats = []
 # Heap profile (dhat-heap.json, written on SIGTERM): where the bytes are.
 dhat-heap = ["dep:dhat"]
-# Allocator experiments (bench_load reports RSS per call).
+# Allocator experiment (bench_load reports RSS per call); Linux uses jemalloc.
 mimalloc = ["dep:mimalloc"]
-jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
 anyhow = "1"
@@ -23,7 +22,6 @@ base64 = "0.22"
 bytes = "1"
 dhat = { version = "0.3", optional = true }
 mimalloc = { version = "0.1", optional = true, default-features = false }
-tikv-jemallocator = { version = "0.6", optional = true }
 futures = "0.3"
 ort = { version = "=2.0.0-rc.15", features = ["download-binaries"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -47,3 +45,8 @@ hound = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# jemalloc on Linux: the lowest resident memory per call of glibc, glibc with
+# MALLOC_ARENA_MAX=2, mimalloc and jemalloc (scripts/linux_memory.sh; PLAN.md).
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6"

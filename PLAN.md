@@ -92,3 +92,8 @@ numbers that matter, not a port.
   connects per call (STT) and per reply (TTS). One shared config: live
   ElevenLabs connects 182–322 ms → 86–172 ms (`tests/live_elevenlabs.rs`,
   `--ignored`). Sockets also skip Nagle now (small audio writes).
+- **Allocator on Linux** (`scripts/linux_memory.sh`, Docker, 4 CPUs; RSS
+  slope 50→200 calls, live heap ~118 KB/call in all): glibc 207 KB/call
+  (185 MB at 200 calls); glibc MALLOC_ARENA_MAX=2 187 KB (176 MB); mimalloc
+  153 KB but +70 MB baseline (247 MB); jemalloc 133 KB (179 MB). jemalloc is
+  now the Linux default. CPU and latency equal across all four.
