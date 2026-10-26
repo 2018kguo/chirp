@@ -107,3 +107,13 @@ numbers that matter, not a port.
 - **Noise floor:** with the host at load ~11–18 from other work, 1,000-call
   runs saturate and their latency varies by 2–3x between runs; compare
   builds interleaved, and below saturation for small effects.
+- **Smart Turn kernel profile** (samply, one thread, M5 Pro, ORT 1.31):
+  int8 GEMM 40% using MLAS's `UDOT` kernel (not the i8mm `UMMLA` one this
+  CPU supports; MLAS detects i8mm on Linux, so Graviton 3+ likely runs
+  faster than this laptop and x86 uses VNNI kernels: laptop numbers are not
+  production numbers); QLinearSoftmax 15.8%; LayerNorm 9.1%; packing,
+  quantize/dequantize and elementwise the rest. The softmax and layer norm
+  quarter is the fusible part.
+- **Benchmarking policy:** no load tests at scale on the owner's laptop.
+  Local: ≤50 calls, short, niced; single-thread microbenchmarks and
+  profiles. Scale curves go to remote hardware.
