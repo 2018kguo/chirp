@@ -13,7 +13,7 @@ use axum::Router;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use crate::admission::Admission;
+use crate::admission::{Admission, CallPermit};
 use crate::brain::Brain;
 use crate::call::{self, Shared, SpeechPolicy};
 use crate::elevenlabs::ElevenLabs;
@@ -50,22 +50,20 @@ where
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route(
+            "/metrics",
+            get(|State(shared): State<Shared>| async move {
+                crate::metrics::render(shared.admission.active())
+            }),
+        )
+        .route(
             "/v1/calls",
             get(
                 move |State(shared): State<Shared>, parts: Parts, upgrade: WebSocketUpgrade| {
                     let brain = make_brain(&call_request(Transport::WebSocket, &parts));
                     async move {
-                        let Some(brain) = brain else {
-                            return (StatusCode::FORBIDDEN, "refused").into_response();
-                        };
-                        // Behind already: a new call would make every call worse.
-                        if shared.turn.overloaded() {
-                            return (StatusCode::SERVICE_UNAVAILABLE, "at capacity")
-                                .into_response();
-                        }
-                        let Some(permit) = shared.admission.admit() else {
-                            return (StatusCode::SERVICE_UNAVAILABLE, "at the call limit")
-                                .into_response();
+                        let (brain, permit) = match admit(&shared, brain) {
+                            Ok(admitted) => admitted,
+                            Err(refusal) => return refusal.into_response(),
                         };
                         // Callers send 640-byte frames: small buffers, and a cap
                         // so no one can make the server hold a huge message.
@@ -88,19 +86,12 @@ where
                 move |State(shared): State<Shared>, parts: Parts, offer: String| {
                     let brain = webrtc_brain(&call_request(Transport::WebRtc, &parts));
                     async move {
-                        let Some(brain) = brain else {
-                            return (StatusCode::FORBIDDEN, "refused").into_response();
-                        };
                         let Some(webrtc) = shared.webrtc.clone() else {
                             return (StatusCode::NOT_FOUND, "WebRTC is off").into_response();
                         };
-                        if shared.turn.overloaded() {
-                            return (StatusCode::SERVICE_UNAVAILABLE, "at capacity")
-                                .into_response();
-                        }
-                        let Some(permit) = shared.admission.admit() else {
-                            return (StatusCode::SERVICE_UNAVAILABLE, "at the call limit")
-                                .into_response();
+                        let (brain, permit) = match admit(&shared, brain) {
+                            Ok(admitted) => admitted,
+                            Err(refusal) => return refusal.into_response(),
                         };
                         match webrtc.answer(&offer, shared, brain, permit).await {
                             Ok(answer) => (
@@ -118,6 +109,29 @@ where
             ),
         )
         .with_state(shared)
+}
+
+/// Whether a call may start: its brain (refused by `make_brain` when
+/// `None`), then capacity. Checked before any paid session opens.
+fn admit<B>(
+    shared: &Shared,
+    brain: Option<B>,
+) -> Result<(B, CallPermit), (StatusCode, &'static str)> {
+    use crate::metrics::{REFUSED_FORBIDDEN, REFUSED_LIMIT, REFUSED_OVERLOADED};
+    let Some(brain) = brain else {
+        REFUSED_FORBIDDEN.add();
+        return Err((StatusCode::FORBIDDEN, "refused"));
+    };
+    // Behind already: a new call would make every call worse.
+    if shared.turn.overloaded() {
+        REFUSED_OVERLOADED.add();
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "at capacity"));
+    }
+    let Some(permit) = shared.admission.admit() else {
+        REFUSED_LIMIT.add();
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "at the call limit"));
+    };
+    Ok((brain, permit))
 }
 
 /// `make_brain`, refusing callers without `CHIRP_TOKEN` when it is set

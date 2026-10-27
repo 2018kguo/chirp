@@ -60,7 +60,9 @@ impl TurnModel {
                     };
                     let Ok(request) = request else { return };
                     let now = Instant::now();
-                    let waited = now.duration_since(request.enqueued).as_micros() as u64;
+                    let waited = now.duration_since(request.enqueued);
+                    crate::metrics::TURN_QUEUE.record(waited);
+                    let waited = waited.as_micros() as u64;
                     // Exponential moving average, weight 1/8; a lost race between
                     // threads only blurs the average.
                     let average = wait_micros.load(Ordering::Relaxed);

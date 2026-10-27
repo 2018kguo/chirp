@@ -8,6 +8,7 @@ pub mod client;
 pub mod elevenlabs;
 pub mod endpoint;
 pub mod heap;
+pub mod metrics;
 pub mod mock;
 pub mod models;
 pub mod onnx;

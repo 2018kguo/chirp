@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::brain::Brain;
 use crate::call::{self, Shared, ToCaller};
+use crate::metrics;
 use crate::playout::{Encoder, Playout, FRAME};
 use crate::request::{CallRequest, Transport};
 
@@ -326,6 +327,7 @@ async fn signaling<B, F>(
                                 }
                             };
                             if shared.turn.overloaded() {
+                                metrics::REFUSED_OVERLOADED.add();
                                 Some(response(&request, "503 Service Unavailable", None, "", ""))
                             } else {
                                 let caller = CallRequest {
@@ -340,8 +342,14 @@ async fn signaling<B, F>(
                                         .collect(),
                                 };
                                 match (make_brain(&caller), shared.admission.admit()) {
-                                    (None, _) => Some(response(&request, "403 Forbidden", None, "", "")),
-                                    (Some(_), None) => Some(response(&request, "503 Service Unavailable", None, "", "")),
+                                    (None, _) => {
+                                        metrics::REFUSED_FORBIDDEN.add();
+                                        Some(response(&request, "403 Forbidden", None, "", ""))
+                                    }
+                                    (Some(_), None) => {
+                                        metrics::REFUSED_LIMIT.add();
+                                        Some(response(&request, "503 Service Unavailable", None, "", ""))
+                                    }
                                     (Some(brain), Some(permit)) => {
                                         let to_tag = format!("{:x}", rand_tag());
                                         let sdp = answer_sdp(media, law);

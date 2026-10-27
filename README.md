@@ -88,6 +88,11 @@ cargo run --release --bin call_client -- ws://127.0.0.1:7861/v1/calls question.w
 
 Building needs cmake (libopus is compiled in).
 
+`GET /metrics` serves Prometheus counters: calls active, started, refused
+(by reason) and failed; turns by what ended them; and the mean time from
+the end of a turn to the reply's first audio and Smart Turn's queue wait.
+`GET /health` answers `ok`.
+
 ## Transports
 
 - **WebSocket**, `GET /v1/calls`: binary messages are 16 kHz mono PCM16 both
