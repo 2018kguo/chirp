@@ -280,3 +280,23 @@ numbers that matter, not a port.
   already small: 50-packet send buffer, 15-packet reorder window, no stats
   or BWE) plus libopus encoder/decoder (C allocations, not in these
   numbers). Not chased further: 250 MB at 1,000 calls.
+- **0.2.0 memory and latency (Oct 27 2026, M-series Mac, 50 calls,
+  interleaved A/B, live heap slope).** `-Zprint-type-sizes` showed a call's
+  future at 15.5 KB, 10.7 KB of it the ElevenLabs `connect_async` future
+  (needed only while connecting); boxing it: future 7.4 KB, the spawned
+  call task 17.9 → 9.8 KB, each reply task 11.8 → 1.5 KB
+  (`call::future_size` keeps it under 8 KB). WebRTC without the
+  transport-wide-cc extension: str0m's queued RTCP (~44 KB per session at
+  peak) is gone, 11% fewer allocations. `Box<Rtc>` (10 KB) in hub channels
+  and maps: idle −1.2 MB. Per call: WebSocket 130 → 112 KB, SIP 132 → 114,
+  WebRTC 268 → 218. **Rejected:** `set_send_buffer_audio(4)` (no
+  measurable change). What remains of WebRTC's extra ~105 KB is str0m's
+  per-session state (SRTP ciphers ~8 KB, stream maps ~7 KB, RTX caches
+  ~8 KB, RTCP queue ~8 KB, DTLS) plus libopus (C heap, not counted).
+- **WebRTC DTX (Oct 27 2026).** The benchmark's callers now encode like
+  Chrome (libopus DTX; libwebrtc sends the first header-only packet of each
+  silence, then nothing). Against them, WebRTC p50 765 ms vs WebSocket 724.
+  Filling silence at once after a header-only packet: p50 765 → 755 ms, p99
+  802 unchanged. The rest of the gap is Opus delay and 20 ms tick phase
+  (fill and playout); **not done:** realigning the playout tick to a
+  reply's first frame (~10 ms mean).
