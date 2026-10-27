@@ -73,10 +73,13 @@ cargo run --release --bin call_client -- ws://127.0.0.1:7861/v1/calls question.w
 | `CHIRP_SYSTEM_PROMPT` | none | |
 | `CHIRP_VAD_THREADS` | cores / 4, at least 2 | |
 | `CHIRP_TURN_THREADS` | cores − 2 | |
-| `CHIRP_RTC_PORT` | 7862 | UDP port every WebRTC call shares |
+| `CHIRP_MAX_CALLS` | 60 per core | calls at once, across transports; past it new calls get 503 |
+| `CHIRP_RTC_PORT` | 7862 | UDP port every WebRTC call shares; `off` disables WebRTC |
 | `CHIRP_PUBLIC_ADDR` | this host's outbound address, that port | where callers send WebRTC media |
 | `CHIRP_SIP_PORT` | off | UDP port to answer SIP calls on (e.g. 5060) |
 | `CHIRP_SIP_RTP_PORT` | 7864 | UDP port every phone call's audio shares |
+| `CHIRP_SIP_ALLOW` | any (warned) | addresses or CIDR blocks allowed to place calls: your trunk's |
+| `CHIRP_SIP_RTP_TIMEOUT_SECS` | 10 | a caller silent on RTP this long has gone; chirp hangs up |
 | `CHIRP_MODELS_DIR` | `models` | missing models are downloaded here at startup |
 | `PORT` | 7861 | |
 
@@ -94,10 +97,11 @@ Building needs cmake (libopus is compiled in).
   WebRTC call.
 - **SIP** (phone calls), when `CHIRP_SIP_PORT` is set: a SIP trunk or
   softphone sends an INVITE with G.711 (PCMU or PCMA) offered; chirp answers
-  and every call's RTP shares one socket. It is a minimal user agent server:
-  UDP only, no digest authentication (allow-list the trunk's addresses), no
-  200 OK retransmission, no hold or re-INVITE, no DTMF, and media must come
-  from the address in the caller's SDP (no NAT latching).
+  and every call's RTP shares one socket. Re-INVITEs (session refreshes) are
+  answered; a call whose audio stops is hung up. It is a minimal user agent
+  server: UDP only, no digest authentication (set `CHIRP_SIP_ALLOW` to the
+  trunk's addresses), no 200 OK retransmission, no hold or DTMF, and media
+  must come from the address in the caller's SDP (no NAT latching).
 
 ## Your own brain
 

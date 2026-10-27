@@ -36,6 +36,7 @@ async fn chirp_with<B: Brain>(
         speech: SpeechPolicy::default(),
         turn_policy: Policy::default(),
         webrtc: None,
+        admission: chirp::admission::Admission::unlimited(),
     };
     let http = reqwest::Client::new();
     let brain_url = format!("http://{mocks}/v1");

@@ -27,35 +27,84 @@ pub struct SipAddrs {
     pub rtp: SocketAddr,
 }
 
+pub struct SipConfig {
+    pub sip_bind: SocketAddr,
+    pub rtp_bind: SocketAddr,
+    /// The address put in SDP for media; by default the RTP socket's own.
+    pub public_ip: Option<IpAddr>,
+    /// A caller who sends no audio for this long has gone: chirp hangs up.
+    pub rtp_timeout: Duration,
+    /// Where requests may come from (addresses or IPv4 CIDR blocks, as
+    /// `parse_allow` reads them); others get no answer. `None` accepts any:
+    /// every call opens paid speech sessions, so set it to the trunk's.
+    pub allow: Option<Vec<(IpAddr, u8)>>,
+}
+
+/// `10.0.0.5, 192.0.2.0/24, ::1` as addresses with prefix lengths.
+pub fn parse_allow(text: &str) -> Result<Vec<(IpAddr, u8)>> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            let (ip, prefix) = item.split_once('/').unwrap_or((item, ""));
+            let ip: IpAddr = ip
+                .parse()
+                .with_context(|| format!("allow-list entry {item}"))?;
+            let full = if ip.is_ipv4() { 32 } else { 128 };
+            let prefix = if prefix.is_empty() {
+                full
+            } else {
+                prefix.parse()?
+            };
+            anyhow::ensure!(prefix <= full, "allow-list entry {item}");
+            Ok((ip, prefix))
+        })
+        .collect()
+}
+
+fn allowed(ip: IpAddr, list: &[(IpAddr, u8)]) -> bool {
+    list.iter().any(|&(net, prefix)| match (ip, net) {
+        (IpAddr::V4(ip), IpAddr::V4(net)) => {
+            let mask = u32::MAX.checked_shl(32 - prefix as u32).unwrap_or(0);
+            u32::from(ip) & mask == u32::from(net) & mask
+        }
+        (IpAddr::V6(ip), IpAddr::V6(net)) => {
+            let mask = u128::MAX.checked_shl(128 - prefix as u32).unwrap_or(0);
+            u128::from(ip) & mask == u128::from(net) & mask
+        }
+        _ => false,
+    })
+}
+
 /// Starts answering SIP calls, making one brain per call with `make_brain`.
-/// `public_ip` is the address put in SDP for media; by default the RTP
-/// socket's own.
-pub async fn start<B, F>(
-    sip_bind: SocketAddr,
-    rtp_bind: SocketAddr,
-    public_ip: Option<IpAddr>,
-    shared: Shared,
-    make_brain: F,
-) -> Result<SipAddrs>
+pub async fn start<B, F>(config: SipConfig, shared: Shared, make_brain: F) -> Result<SipAddrs>
 where
     B: Brain,
     F: Fn() -> B + Send + Sync + 'static,
 {
-    let sip = UdpSocket::bind(sip_bind)
+    let sip = UdpSocket::bind(config.sip_bind)
         .await
-        .with_context(|| format!("SIP socket on {sip_bind}"))?;
-    let rtp = UdpSocket::bind(rtp_bind)
+        .with_context(|| format!("SIP socket on {}", config.sip_bind))?;
+    let rtp = UdpSocket::bind(config.rtp_bind)
         .await
-        .with_context(|| format!("RTP socket on {rtp_bind}"))?;
+        .with_context(|| format!("RTP socket on {}", config.rtp_bind))?;
     let addrs = SipAddrs {
         sip: sip.local_addr()?,
         rtp: rtp.local_addr()?,
     };
-    let media = SocketAddr::new(public_ip.unwrap_or(addrs.rtp.ip()), addrs.rtp.port());
+    let media = SocketAddr::new(config.public_ip.unwrap_or(addrs.rtp.ip()), addrs.rtp.port());
     let (to_media, from_signaling) = mpsc::channel(64);
-    let (ended_tx, ended) = mpsc::channel(64);
-    tokio::spawn(media_hub(rtp, from_signaling, ended_tx));
-    tokio::spawn(signaling(sip, media, to_media, ended, shared, make_brain));
+    let (ended_tx, ended) = mpsc::channel(1024);
+    tokio::spawn(media_hub(rtp, from_signaling, ended_tx, config.rtp_timeout));
+    tokio::spawn(signaling(
+        sip,
+        media,
+        config.allow,
+        to_media,
+        ended,
+        shared,
+        make_brain,
+    ));
     Ok(addrs)
 }
 
@@ -86,6 +135,14 @@ impl Message {
 
     fn method(&self) -> &str {
         self.start.split(' ').next().unwrap_or_default()
+    }
+
+    /// The transaction: the top Via's branch.
+    fn branch(&self) -> &str {
+        self.header("Via")
+            .and_then(|via| via.split(";branch=").nth(1))
+            .map(|branch| branch.split(';').next().unwrap_or(branch))
+            .unwrap_or_default()
     }
 
     fn header(&self, name: &str) -> Option<&str> {
@@ -187,7 +244,11 @@ fn answer_sdp(media: SocketAddr, law: Law) -> String {
 
 /// An answered call, for retransmitted INVITEs and for hanging up.
 struct Dialog {
+    /// The last INVITE transaction answered, and its answer: a
+    /// retransmission gets the same answer, a re-INVITE a new one.
+    branch: String,
     answer: String,
+    sdp: String,
     caller: SocketAddr,
     remote_media: SocketAddr,
     /// What a BYE from chirp needs.
@@ -209,6 +270,7 @@ enum ToMedia {
 async fn signaling<B, F>(
     socket: UdpSocket,
     media: SocketAddr,
+    allow: Option<Vec<(IpAddr, u8)>>,
     to_media: mpsc::Sender<ToMedia>,
     mut ended: mpsc::Receiver<SocketAddr>,
     shared: Shared,
@@ -229,6 +291,9 @@ async fn signaling<B, F>(
         tokio::select! {
             received = socket.recv_from(&mut buffer) => {
                 let Ok((length, from)) = received else { continue };
+                if allow.as_ref().is_some_and(|list| !allowed(from.ip(), list)) {
+                    continue; // not the trunk: no answer at all
+                }
                 let Ok(text) = std::str::from_utf8(&buffer[..length]) else { continue };
                 let Some(request) = Message::parse(text) else { continue };
                 if request.start.starts_with("SIP/2.0") {
@@ -237,11 +302,21 @@ async fn signaling<B, F>(
                 let call_id = request.header("Call-ID").unwrap_or_default().to_string();
                 let reply = match request.method() {
                     "INVITE" => {
-                        if let Some(dialog) = dialogs.get(&call_id) {
-                            Some(dialog.answer.clone()) // a retransmission
+                        let offer = read_offer(&request.body);
+                        if let Some(dialog) = dialogs.get_mut(&call_id) {
+                            if dialog.branch != request.branch() {
+                                // A re-INVITE (a session refresh): same call, same media.
+                                let extra = format!("{contact}Content-Type: application/sdp\r\n");
+                                dialog.answer = response(&request, "200 OK", Some(&dialog.to_tag), &extra, &dialog.sdp);
+                                dialog.branch = request.branch().to_string();
+                            }
+                            Some(dialog.answer.clone())
+                        } else if offer.is_some_and(|(remote, _)| dialogs.values().any(|d| d.remote_media == remote)) {
+                            // That media address is another call's.
+                            Some(response(&request, "486 Busy Here", None, "", ""))
                         } else if shared.turn.overloaded() {
                             Some(response(&request, "503 Service Unavailable", None, "", ""))
-                        } else if let Some((remote, law)) = read_offer(&request.body) {
+                        } else if let (Some((remote, law)), Some(permit)) = (offer, offer.and_then(|_| shared.admission.admit())) {
                             let to_tag = format!("{:x}", rand_tag());
                             let sdp = answer_sdp(media, law);
                             let extra = format!("{contact}Content-Type: application/sdp\r\n");
@@ -257,9 +332,15 @@ async fn signaling<B, F>(
                             let audio = futures::stream::unfold(audio, |mut audio| async move {
                                 audio.recv().await.map(|pcm| (pcm, audio))
                             });
-                            tokio::spawn(call::run(Box::pin(audio), to_caller, shared.clone(), make_brain()));
+                            let (shared, brain) = (shared.clone(), make_brain());
+                            tokio::spawn(async move {
+                                call::run(Box::pin(audio), to_caller, shared, brain).await;
+                                drop(permit);
+                            });
                             dialogs.insert(call_id, Dialog {
+                                branch: request.branch().to_string(),
                                 answer: answer.clone(),
+                                sdp,
                                 caller: from,
                                 remote_media: remote,
                                 to_tag,
@@ -267,6 +348,8 @@ async fn signaling<B, F>(
                                 cseq: 1,
                             });
                             Some(answer)
+                        } else if offer.is_some() {
+                            Some(response(&request, "503 Service Unavailable", None, "", ""))
                         } else {
                             Some(response(&request, "488 Not Acceptable Here", None, "", ""))
                         }
@@ -349,6 +432,8 @@ struct RtpCall {
     timestamp: u32,
     ssrc: u32,
     started: bool,
+    /// When the caller's audio last arrived (or the call started).
+    last_rtp: tokio::time::Instant,
 }
 
 /// Every SIP call's audio on one socket.
@@ -356,6 +441,7 @@ async fn media_hub(
     socket: UdpSocket,
     mut from_signaling: mpsc::Receiver<ToMedia>,
     ended: mpsc::Sender<SocketAddr>,
+    rtp_timeout: Duration,
 ) {
     let mut calls: HashMap<SocketAddr, RtpCall> = HashMap::new();
     let mut buffer = vec![0u8; 2048];
@@ -376,6 +462,7 @@ async fn media_hub(
                         timestamp: 0,
                         ssrc: rand_tag() as u32,
                         started: false,
+                        last_rtp: tokio::time::Instant::now(),
                     });
                 }
                 // Dropping the call's audio sender ends the call.
@@ -386,6 +473,7 @@ async fn media_hub(
                 let Ok((length, source)) = received else { continue };
                 let Some(call) = calls.get_mut(&source) else { continue };
                 let Some(payload) = rtp_payload(&buffer[..length]) else { continue };
+                call.last_rtp = tokio::time::Instant::now();
                 let narrow: Vec<i16> = payload.iter().map(|byte| decode(call.law, *byte)).collect();
                 let wide = call.up.process(&narrow);
                 let pcm: Vec<u8> = wide.iter().flat_map(|sample| sample.to_le_bytes()).collect();
@@ -414,7 +502,8 @@ async fn media_hub(
                     }
                     // The RTP clock runs whether or not chirp is speaking.
                     call.timestamp = call.timestamp.wrapping_add((FRAME / 2) as u32);
-                    if call.playout.finished() {
+                    // Ended on chirp's side, or the caller went without a BYE.
+                    if call.playout.finished() || call.last_rtp.elapsed() > rtp_timeout {
                         finished.push(*remote);
                     }
                 }

@@ -35,13 +35,20 @@ where
                             return (StatusCode::SERVICE_UNAVAILABLE, "at capacity")
                                 .into_response();
                         }
+                        let Some(permit) = shared.admission.admit() else {
+                            return (StatusCode::SERVICE_UNAVAILABLE, "at the call limit")
+                                .into_response();
+                        };
                         // Callers send 640-byte frames: small buffers, and a cap
                         // so no one can make the server hold a huge message.
                         upgrade
                             .read_buffer_size(4 * 1024)
                             .write_buffer_size(0)
                             .max_message_size(64 * 1024)
-                            .on_upgrade(move |socket| call::run_websocket(socket, shared, brain))
+                            .on_upgrade(move |socket| async move {
+                                call::run_websocket(socket, shared, brain).await;
+                                drop(permit);
+                            })
                             .into_response()
                     }
                 },
@@ -58,7 +65,11 @@ where
                     if shared.turn.overloaded() {
                         return (StatusCode::SERVICE_UNAVAILABLE, "at capacity").into_response();
                     }
-                    match webrtc.answer(&offer, shared, brain).await {
+                    let Some(permit) = shared.admission.admit() else {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "at the call limit")
+                            .into_response();
+                    };
+                    match webrtc.answer(&offer, shared, brain, permit).await {
                         Ok(answer) => (
                             StatusCode::CREATED,
                             [(axum::http::header::CONTENT_TYPE, "application/sdp")],
@@ -107,14 +118,21 @@ where
     let Ok(port) = std::env::var("CHIRP_SIP_PORT") else {
         return Ok(());
     };
-    let sip = crate::sip::start(
-        ([0, 0, 0, 0], port.parse()?).into(),
-        ([0, 0, 0, 0], env_or("CHIRP_SIP_RTP_PORT", 7864u16)).into(),
-        Some(public_ip().await?),
-        shared.clone(),
-        make_brain,
-    )
-    .await?;
+    let allow = match std::env::var("CHIRP_SIP_ALLOW") {
+        Ok(list) => Some(crate::sip::parse_allow(&list)?),
+        Err(_) => {
+            tracing::warn!("CHIRP_SIP_ALLOW is unset: any address can place calls (each opens paid speech sessions)");
+            None
+        }
+    };
+    let config = crate::sip::SipConfig {
+        sip_bind: ([0, 0, 0, 0], port.parse()?).into(),
+        rtp_bind: ([0, 0, 0, 0], env_or("CHIRP_SIP_RTP_PORT", 7864u16)).into(),
+        public_ip: Some(public_ip().await?),
+        rtp_timeout: std::time::Duration::from_secs(env_or("CHIRP_SIP_RTP_TIMEOUT_SECS", 10)),
+        allow,
+    };
+    let sip = crate::sip::start(config, shared.clone(), make_brain).await?;
     tracing::info!(sip = %sip.sip, rtp = %sip.rtp, "SIP listening");
     Ok(())
 }
@@ -155,19 +173,27 @@ pub async fn shared_from_env() -> anyhow::Result<Shared> {
         elevenlabs: ElevenLabs::from_env()?,
         speech: SpeechPolicy::default(),
         turn_policy: crate::turn_taking::Policy::default(),
-        webrtc: Some(webrtc_from_env().await?),
+        webrtc: webrtc_from_env().await?,
+        // ~62 calls per vCPU served cleanly on a c7a (PLAN.md); past the
+        // limit new calls are refused before they open any paid session.
+        admission: crate::admission::Admission::new(env_or("CHIRP_MAX_CALLS", cores * 60)),
     })
 }
 
 /// WebRTC media on UDP `CHIRP_RTC_PORT` (default 7862), reached at
 /// `CHIRP_PUBLIC_ADDR` (default: this host's outbound address, that port).
-async fn webrtc_from_env() -> anyhow::Result<crate::webrtc::WebRtc> {
+async fn webrtc_from_env() -> anyhow::Result<Option<crate::webrtc::WebRtc>> {
+    if std::env::var("CHIRP_RTC_PORT").as_deref() == Ok("off") {
+        return Ok(None);
+    }
     let port = env_or("CHIRP_RTC_PORT", 7862u16);
     let public = match std::env::var("CHIRP_PUBLIC_ADDR") {
         Ok(address) => address.parse()?,
         Err(_) => SocketAddr::new(outbound_ip().await, port),
     };
-    crate::webrtc::WebRtc::start(([0, 0, 0, 0], port).into(), Some(public)).await
+    Ok(Some(
+        crate::webrtc::WebRtc::start(([0, 0, 0, 0], port).into(), Some(public)).await?,
+    ))
 }
 
 /// The address this host sends from (no packet is sent), else loopback.

@@ -41,6 +41,8 @@ pub struct Shared {
     pub turn_policy: Policy,
     /// Calls over WebRTC (`POST /v1/webrtc`), when enabled.
     pub webrtc: Option<crate::webrtc::WebRtc>,
+    /// The limit on calls at once, across transports.
+    pub admission: crate::admission::Admission,
 }
 
 /// How much of a reply is spoken.

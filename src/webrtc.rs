@@ -9,7 +9,7 @@
 //! as the body returns the answer (as WHIP does). chirp is ICE-lite with one
 //! host candidate, the address in `CHIRP_PUBLIC_ADDR`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,7 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig}
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use crate::admission::CallPermit;
 use crate::brain::Brain;
 use crate::call::{self, Shared, ToCaller};
 use crate::playout::{Playout, FRAME};
@@ -33,6 +34,8 @@ use crate::playout::{Playout, FRAME};
 const FRAME_RTP_TICKS: u64 = 960;
 /// No caller audio for this long (beyond network jitter) is silence.
 const SILENCE_AFTER: Duration = Duration::from_millis(60);
+/// Events kept for a caller whose data channel isn't (or never) open.
+const MAX_QUEUED_EVENTS: usize = 256;
 
 /// The shared socket's hub; cloning shares it.
 #[derive(Clone)]
@@ -59,8 +62,15 @@ impl WebRtc {
         Ok(Self { peers, public })
     }
 
-    /// Answers a caller's SDP offer and starts their call.
-    pub async fn answer<B: Brain>(&self, offer: &str, shared: Shared, brain: B) -> Result<String> {
+    /// Answers a caller's SDP offer and starts their call, which holds
+    /// `permit` (its place under the call limit) until it ends.
+    pub async fn answer<B: Brain>(
+        &self,
+        offer: &str,
+        shared: Shared,
+        brain: B,
+        permit: CallPermit,
+    ) -> Result<String> {
         let mut rtc = RtcConfig::new()
             .set_ice_lite(true)
             .clear_codecs()
@@ -91,6 +101,7 @@ impl WebRtc {
             rtp_time: 0,
             last_media: None,
             filled_until: Instant::now(),
+            next_timeout: Instant::now(),
         };
         self.peers
             .send(peer)
@@ -99,7 +110,10 @@ impl WebRtc {
         let audio = futures::stream::unfold(audio, |mut audio| async move {
             audio.recv().await.map(|pcm| (pcm, audio))
         });
-        tokio::spawn(call::run(Box::pin(audio), to_caller, shared, brain));
+        tokio::spawn(async move {
+            call::run(Box::pin(audio), to_caller, shared, brain).await;
+            drop(permit);
+        });
         Ok(answer.to_sdp_string())
     }
 }
@@ -123,6 +137,8 @@ struct Peer {
     /// been filled with silence.
     last_media: Option<Instant>,
     filled_until: Instant,
+    /// When the session next needs time, whether or not packets arrive.
+    next_timeout: Instant,
 }
 
 impl Peer {
@@ -210,11 +226,18 @@ impl Peer {
                 }
             }
         }
+        // Without a data channel, events have nowhere to go: keep the latest.
+        while self.events.len() > MAX_QUEUED_EVENTS {
+            self.events.pop_front();
+        }
         if let Some(frame) = self.playout.frame() {
             self.play(&frame, now);
         }
+        // The RTP clock is real time, speaking or not, so the browser's
+        // jitter buffer sees a pause as a pause.
+        self.rtp_time += FRAME_RTP_TICKS;
         // The call is over and everything it said has been delivered.
-        if self.playout.finished() && self.events.is_empty() {
+        if self.playout.finished() && (self.events.is_empty() || self.channel.is_none()) {
             self.rtc.disconnect();
         }
     }
@@ -242,29 +265,38 @@ impl Peer {
             }
         };
         let time = MediaTime::new(self.rtp_time, Frequency::FORTY_EIGHT_KHZ);
-        self.rtp_time += FRAME_RTP_TICKS;
         if let Err(error) = writer.write(pt, now, time, self.encoded[..length].to_vec()) {
             tracing::debug!(%error, "dropped an audio frame");
         }
     }
 }
 
-/// Serves every WebRTC call on one socket.
+/// Serves every WebRTC call on one socket. A packet goes straight to the
+/// peer its source address belongs to (the first ones from an address are
+/// matched by asking each session); only peers that are due get their
+/// timeouts, so a packet costs one peer's work, not every peer's.
 async fn hub(socket: UdpSocket, public: SocketAddr, mut incoming: mpsc::Receiver<Peer>) {
-    let mut peers: Vec<Peer> = Vec::new();
+    let mut peers: HashMap<u64, Peer> = HashMap::new();
+    let mut routes: HashMap<SocketAddr, u64> = HashMap::new();
+    let mut next_id = 0u64;
     let mut buffer = vec![0u8; 2000];
     let mut pace = tokio::time::interval(Duration::from_millis(20));
-    pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A late tick plays the frames it owes, so a busy hub catches up
+    // instead of falling further behind.
+    pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     loop {
-        let mut next = Instant::now() + Duration::from_millis(100);
-        for peer in &mut peers {
-            next = next.min(peer.drive(&socket));
-        }
-        // A peer that is gone drops its audio sender, which ends its call.
-        peers.retain(|peer| peer.rtc.is_alive());
+        let next = peers
+            .values()
+            .map(|peer| peer.next_timeout)
+            .min()
+            .unwrap_or_else(|| Instant::now() + Duration::from_millis(100));
         tokio::select! {
             peer = incoming.recv() => match peer {
-                Some(peer) => peers.push(peer),
+                Some(mut peer) => {
+                    peer.next_timeout = peer.drive(&socket);
+                    peers.insert(next_id, peer);
+                    next_id += 1;
+                }
                 None => return,
             },
             received = socket.recv_from(&mut buffer) => {
@@ -274,26 +306,44 @@ async fn hub(socket: UdpSocket, public: SocketAddr, mut incoming: mpsc::Receiver
                     Instant::now(),
                     Receive { proto: Protocol::Udp, source, destination: public, contents },
                 );
-                if let Some(peer) = peers.iter_mut().find(|peer| peer.rtc.accepts(&input)) {
-                    if let Err(error) = peer.rtc.handle_input(input) {
-                        tracing::debug!(%error, "WebRTC input rejected");
-                        peer.rtc.disconnect();
-                    }
+                let known = routes
+                    .get(&source)
+                    .copied()
+                    .filter(|id| peers.get(id).is_some_and(|peer| peer.rtc.accepts(&input)));
+                let Some(id) = known.or_else(|| {
+                    peers.iter().find(|(_, peer)| peer.rtc.accepts(&input)).map(|(id, _)| *id)
+                }) else {
+                    continue;
+                };
+                routes.insert(source, id);
+                let Some(peer) = peers.get_mut(&id) else { continue };
+                if let Err(error) = peer.rtc.handle_input(input) {
+                    tracing::debug!(%error, "WebRTC input rejected");
+                    peer.rtc.disconnect();
                 }
+                peer.next_timeout = peer.drive(&socket);
             }
             _ = pace.tick() => {
                 let now = Instant::now();
-                for peer in &mut peers {
+                for peer in peers.values_mut() {
                     peer.pace(now);
+                    peer.next_timeout = peer.drive(&socket);
                 }
             }
             _ = tokio::time::sleep_until(next.into()) => {}
         }
         let now = Instant::now();
-        for peer in &mut peers {
+        for peer in peers.values_mut().filter(|peer| peer.next_timeout <= now) {
             if peer.rtc.is_alive() {
                 let _ = peer.rtc.handle_input(Input::Timeout(now));
             }
+            peer.next_timeout = peer.drive(&socket);
+        }
+        // A peer that is gone drops its audio sender, which ends its call.
+        let before = peers.len();
+        peers.retain(|_, peer| peer.rtc.is_alive());
+        if peers.len() != before {
+            routes.retain(|_, id| peers.contains_key(id));
         }
     }
 }

@@ -27,6 +27,7 @@ async fn overloaded_calls_degrade_and_close_promptly() {
         speech: SpeechPolicy::default(),
         turn_policy: Policy::default(),
         webrtc: None,
+        admission: chirp::admission::Admission::unlimited(),
     };
     let turn = shared.turn.clone();
     let http = reqwest::Client::new();

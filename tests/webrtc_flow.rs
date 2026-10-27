@@ -31,10 +31,16 @@ fn root() -> &'static Path {
 struct Heard {
     events: Vec<(Duration, Value)>,
     audio_at: Vec<Duration>,
+    /// Each reply packet's RTP time (seconds) with its arrival.
+    rtp: Vec<(Duration, f64)>,
     reply_samples: usize,
 }
 
 async fn chirp_webrtc(script: Script) -> String {
+    chirp_webrtc_limited(script, usize::MAX).await
+}
+
+async fn chirp_webrtc_limited(script: Script, max_calls: usize) -> String {
     let mocks = mock::start(script).await.unwrap();
     let shared = Shared {
         vad: VadModel::spawn(&root().join("models/silero_vad.onnx")).unwrap(),
@@ -42,6 +48,7 @@ async fn chirp_webrtc(script: Script) -> String {
         elevenlabs: ElevenLabs::new("mock", format!("ws://{mocks}")).unwrap(),
         speech: SpeechPolicy::default(),
         turn_policy: Policy::default(),
+        admission: chirp::admission::Admission::new(max_calls),
         webrtc: Some(
             WebRtc::start("127.0.0.1:0".parse().unwrap(), None)
                 .await
@@ -92,6 +99,7 @@ async fn call(url: &str, audio: Vec<i16>, seconds: u64) -> Heard {
     let mut heard = Heard {
         events: Vec::new(),
         audio_at: Vec::new(),
+        rtp: Vec::new(),
         reply_samples: 0,
     };
     let started = Instant::now();
@@ -109,6 +117,7 @@ async fn call(url: &str, audio: Vec<i16>, seconds: u64) -> Heard {
                     heard.reply_samples +=
                         decoder.decode(&data.data, &mut decoded, false).unwrap_or(0);
                     heard.audio_at.push(started.elapsed());
+                    heard.rtp.push((started.elapsed(), data.time.as_seconds()));
                 }
                 Output::Event(Event::ChannelData(data)) => {
                     if let Ok(event) = serde_json::from_slice(&data.data) {
@@ -224,4 +233,33 @@ async fn barge_in_over_webrtc_stops_the_reply_at_once() {
         late.is_empty(),
         "reply audio kept playing after the interrupt: {late:?} ms"
     );
+    // Between the two replies chirp was silent; the RTP clock kept real
+    // time, so the browser's jitter buffer sees a pause, not late audio.
+    let (wall, rtp) = heard
+        .rtp
+        .windows(2)
+        .map(|pair| ((pair[1].0 - pair[0].0).as_secs_f64(), pair[1].1 - pair[0].1))
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .expect("reply packets");
+    assert!(
+        wall > 1.0,
+        "expected a pause between replies, longest gap {wall:.2} s"
+    );
+    assert!(
+        (rtp - wall).abs() < 0.3,
+        "a {wall:.2} s pause advanced the RTP clock by {rtp:.2} s"
+    );
+}
+
+/// Past the call limit, an offer is refused before any session opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offer_over_the_call_limit_is_refused() {
+    let url = chirp_webrtc_limited(Script::default(), 0).await;
+    let response = reqwest::Client::new()
+        .post(&url)
+        .body("v=0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
 }

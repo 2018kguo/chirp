@@ -232,3 +232,14 @@ numbers that matter, not a port.
   so it missed this; it now skips silent frames like a browser, and both
   WebRTC tests failed until the hub filled caller gaps over 60 ms with
   silence in real time.
+- **Transport hardening after an adversarial review (Oct 27 2026).** A SIP
+  caller that vanished without BYE held its call (and paid speech sessions)
+  forever: calls now end after `CHIRP_SIP_RTP_TIMEOUT_SECS` of no RTP, with a
+  BYE. Any client could open unbounded paid sessions: a global call limit
+  (`CHIRP_MAX_CALLS`, 60 per core) gates every transport, and
+  `CHIRP_SIP_ALLOW` restricts who may place calls. Re-INVITEs got the first
+  transaction's stale 200 OK; a second call could take over another's media
+  address (now 486). The WebRTC RTP clock stopped while chirp was silent
+  (now real time). The WebRTC hub polled every peer on every packet
+  (O(N^2) per second at N calls): packets now route by source address and
+  only due peers get timeouts. Each has a test that fails without its fix.
