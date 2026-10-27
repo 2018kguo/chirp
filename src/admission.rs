@@ -50,10 +50,15 @@ impl Admission {
         self.active.load(Ordering::Acquire)
     }
 
+    /// Refuses new calls from now on.
+    pub fn close(&self) {
+        self.draining.store(true, Ordering::Release);
+    }
+
     /// Refuses new calls from now on, then waits up to `timeout` for the
     /// calls in progress to end. Returns how many are still running.
     pub async fn drain(&self, timeout: std::time::Duration) -> usize {
-        self.draining.store(true, Ordering::Release);
+        self.close();
         let deadline = tokio::time::Instant::now() + timeout;
         // ponytail: polls; a Notify on permit drop if drains ever need to be exact.
         while self.active() > 0 && tokio::time::Instant::now() < deadline {

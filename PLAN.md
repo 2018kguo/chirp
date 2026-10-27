@@ -293,10 +293,14 @@ numbers that matter, not a port.
   measurable change). What remains of WebRTC's extra ~105 KB is str0m's
   per-session state (SRTP ciphers ~8 KB, stream maps ~7 KB, RTX caches
   ~8 KB, RTCP queue ~8 KB, DTLS) plus libopus (C heap, not counted).
-- **WebRTC DTX (Oct 27 2026).** The benchmark's callers now encode like
-  Chrome (libopus DTX; libwebrtc sends the first header-only packet of each
-  silence, then nothing). Against them, WebRTC p50 765 ms vs WebSocket 724.
-  Filling silence at once after a header-only packet: p50 765 → 755 ms, p99
-  802 unchanged. The rest of the gap is Opus delay and 20 ms tick phase
-  (fill and playout); **not done:** realigning the playout tick to a
-  reply's first frame (~10 ms mean).
+- **WebRTC latency vs WebSocket (Oct 27 2026).** Browsers use Opus DTX only
+  when the answer's fmtp has `usedtx=1`, which str0m's doesn't, so they send
+  every 20 ms frame; the benchmark's callers had dropped silent frames
+  instead, making chirp wait out its 60 ms gap rule every turn. Sending
+  every frame, one call: turn end +6 ms over WebSocket (Opus lookahead),
+  first reply audio +14 ms (adds the 20 ms playout tick's phase). At 50
+  calls on one Mac: p50 770 vs 724 ms, the rest being the benchmark's 50
+  str0m clients in one process. **Rejected:** treating a header-only Opus
+  packet as "DTX began, fill now" (−10 ms only for DTX callers, which
+  browsers aren't, and it sent empty chunks). **Not done:** sending a
+  reply's first frame off-tick (~10 ms mean).

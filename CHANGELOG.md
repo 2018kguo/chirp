@@ -33,10 +33,14 @@ Interleaved A/B at 50 calls (live heap per call):
   218 KB. The speech-to-text TLS handshake (~10 KB) no longer sits in every
   call's future for its whole life, WebRTC negotiates no congestion
   feedback it never used, and str0m's 10 KB session state is boxed.
-- **WebRTC turns end 10 ms sooner** (p50 765 → 755 ms): a header-only Opus
-  packet (the browser entering DTX) means silence now, without first
-  waiting out network jitter.
+- **Benchmark:** WebRTC callers now send every 20 ms frame, silence
+  included, as browsers do (chirp's answer doesn't offer `usedtx=1`); they
+  used to drop silent frames, which made WebRTC look slower than it is.
 
+### Fixed
+
+- A turn still ends when a WebRTC caller sends nothing in silence (now
+  tested directly).
 
 ## 0.1.0 (2026-10-27)
 
