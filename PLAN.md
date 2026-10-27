@@ -304,3 +304,8 @@ numbers that matter, not a port.
   packet as "DTX began, fill now" (−10 ms only for DTX callers, which
   browsers aren't, and it sent empty chunks). **Not done:** sending a
   reply's first frame off-tick (~10 ms mean).
+- **Rejected: batching Smart Turn across calls (Oct 27 2026, M-series,
+  one thread).** ms per decision by batch size 1/2/4/8/16: 36.9 / 35.9 /
+  35.7 / 35.8 / 38.2 (arena on; off is the same within 1 ms). Its GEMMs
+  are already large (800 frames, 400 positions after the conv), so a batch
+  only adds queueing delay. Smart Turn stays one decision per run.
