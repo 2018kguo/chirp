@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.0 (2026-10-27)
+
+### SIP
+
+- **Answers survive packet loss.** Over UDP a 200 OK can be lost; chirp
+  now resends it (RFC 3261: 500 ms, doubling to 4 s) until the caller's
+  ACK arrives, and hangs up if none comes within 32 s. Re-INVITE answers
+  too. Before, one lost answer dropped the call.
+- A call ended by chirp is reported by Call-ID, so a late notice can no
+  longer hang up a newer call that reused the same media address.
+
+### Metrics
+
+- First-audio and Smart Turn queue-wait timings are Prometheus histograms
+  (5 ms to 10 s buckets): percentiles with `histogram_quantile`, not only
+  means. `_sum` and `_count` are unchanged.
+
+### Measured, not shipped
+
+- Batching Smart Turn decisions across calls: 36.9 ms per decision alone,
+  35.7 at best batched (M-series, one thread). Its matrices are already
+  large, so batching would only add queueing delay (PLAN.md).
+
+
 ## 0.2.0 (2026-10-27)
 
 ### Breaking
