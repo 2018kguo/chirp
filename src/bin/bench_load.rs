@@ -1,7 +1,10 @@
 //! Throughput: N concurrent callers holding conversations with one engine
 //! process, against the scripted mocks in another process.
 //!
-//!     cargo run --release --bin bench_load -- chirp|pipecat <calls> [seconds]
+//!     cargo run --release --bin bench_load -- chirp|chirp-webrtc|chirp-sip|pipecat <calls> [seconds]
+//!
+//! `chirp` calls over WebSocket; `chirp-webrtc` and `chirp-sip` drive the
+//! same server over WebRTC (browser-like peers) and SIP (softphones).
 //!
 //! Every caller loops: ask the question (real speech), stay silent while the
 //! reply plays, ask again. Reports the engine process's CPU (cores busy and
@@ -51,6 +54,63 @@ impl Drop for Process {
             .status();
         let _ = self.0.wait();
     }
+}
+
+/// One caller over WebRTC or SIP: the same loop as `converse` (ask, stay
+/// silent through the reply, ask again), played through `chirp::client`.
+async fn converse_rtc(
+    transport: &str,
+    url: &str,
+    sip: std::net::SocketAddr,
+    speech: &[i16],
+    speech_end: Duration,
+    until: Instant,
+) -> Result<Vec<f64>> {
+    let turn: Vec<i16> = speech
+        .iter()
+        .copied()
+        .chain(std::iter::repeat_n(0, (GAP.as_millis() * 16) as usize))
+        .collect();
+    let turn_length = Duration::from_millis(turn.len() as u64 / 16);
+    let turns = (until.saturating_duration_since(Instant::now()).as_millis()
+        / turn_length.as_millis())
+    .max(1);
+    let audio: Vec<i16> = turn
+        .iter()
+        .copied()
+        .cycle()
+        .take(turn.len() * turns as usize)
+        .collect();
+    let outcome = if transport == "chirp-sip" {
+        chirp::client::play_sip(sip, audio).await?
+    } else {
+        chirp::client::play_webrtc(
+            &url.replace("ws://", "http://")
+                .replace("/v1/calls", "/v1/webrtc"),
+            audio,
+        )
+        .await?
+    };
+    if let Some((_, error)) = outcome.events.iter().find(|(_, e)| e["type"] == "error") {
+        bail!("error event: {}", error["message"]);
+    }
+    let mut latencies = Vec::new();
+    let mut answered = u64::MAX;
+    for at in outcome.audio_at {
+        let turn = (at.as_millis() / turn_length.as_millis()) as u64;
+        let end = turn_length * turn as u32 + speech_end;
+        if at > end && turn != answered {
+            answered = turn;
+            latencies.push((at - end).as_secs_f64() * 1000.0);
+        }
+    }
+    Ok(latencies)
+}
+
+fn free_udp_port() -> Result<u16> {
+    Ok(std::net::UdpSocket::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port())
 }
 
 fn free_port() -> Result<u16> {
@@ -181,11 +241,12 @@ async fn main() -> Result<()> {
     wait_for(mocks_port).await?;
     let mocks = format!("127.0.0.1:{mocks_port}");
     let port = free_port()?;
+    let (rtc_port, sip_port, sip_rtp_port) = (free_udp_port()?, free_udp_port()?, free_udp_port()?);
     let log = std::fs::File::create(
         std::env::temp_dir().join(format!("bench_load-{engine}-{calls}.log")),
     )?;
     let mut command = match engine.as_str() {
-        "chirp" => {
+        "chirp" | "chirp-webrtc" | "chirp-sip" => {
             // CHIRP_BIN: another build of the server (allocator experiments).
             let binary = std::env::var_os("CHIRP_BIN")
                 .map_or_else(|| release.join("chirp"), std::path::PathBuf::from);
@@ -197,6 +258,12 @@ async fn main() -> Result<()> {
                 .env("CHIRP_BRAIN_URL", format!("http://{mocks}/v1"))
                 .env("CHIRP_BRAIN_KEY", "mock")
                 .env("CHIRP_BRAIN_MODEL", "mock")
+                .env("CHIRP_RTC_PORT", rtc_port.to_string())
+                .env("CHIRP_PUBLIC_ADDR", format!("127.0.0.1:{rtc_port}"))
+                .env("CHIRP_SIP_PORT", sip_port.to_string())
+                .env("CHIRP_SIP_RTP_PORT", sip_rtp_port.to_string())
+                .env("CHIRP_SIP_ALLOW", "127.0.0.1")
+                .env("CHIRP_MAX_CALLS", "100000")
                 .env("RUST_LOG", "warn");
             for name in [
                 "CHIRP_VAD_THREADS",
@@ -229,7 +296,7 @@ async fn main() -> Result<()> {
     wait_for(port).await?;
     // chirp is the process we spawned; for Pipecat, `uv run` is a parent of
     // the Python process, so measure whatever listens on the port.
-    let pid = if engine == "chirp" {
+    let pid = if engine.starts_with("chirp") {
         server.0.id()
     } else {
         let out = Command::new("lsof")
@@ -265,7 +332,8 @@ async fn main() -> Result<()> {
     let until = started + Duration::from_secs(seconds);
     let callers: Vec<_> = (0..calls)
         .map(|i| {
-            let (url, speech) = (url.clone(), speech.clone());
+            let (url, speech, transport) = (url.clone(), speech.clone(), engine.clone());
+            let sip: std::net::SocketAddr = ([127, 0, 0, 1], sip_port).into();
             tokio::spawn(async move {
                 // Stagger starts across one turn so callers don't speak in lockstep.
                 tokio::time::sleep(Duration::from_millis(
@@ -274,12 +342,15 @@ async fn main() -> Result<()> {
                 .await;
                 // A call that never ends is a failure, not a hung benchmark.
                 let deadline = until + Duration::from_secs(20);
-                match tokio::time::timeout_at(
-                    deadline.into(),
-                    converse(url, speech, speech_end, until),
-                )
-                .await
-                {
+                let call = async {
+                    match transport.as_str() {
+                        "chirp-webrtc" | "chirp-sip" => {
+                            converse_rtc(&transport, &url, sip, &speech, speech_end, until).await
+                        }
+                        _ => converse(url, speech, speech_end, until).await,
+                    }
+                };
+                match tokio::time::timeout_at(deadline.into(), call).await {
                     Ok(result) => result,
                     Err(_) => bail!("call still open 20 s after the caller hung up"),
                 }
