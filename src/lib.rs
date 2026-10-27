@@ -13,6 +13,7 @@ pub mod models;
 pub mod onnx;
 pub mod openai;
 pub mod playout;
+pub mod request;
 pub mod ring;
 pub mod server;
 pub mod sip;

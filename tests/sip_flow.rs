@@ -25,6 +25,8 @@ struct Setup {
     rtp_timeout: Duration,
     allow: Option<&'static str>,
     max_calls: usize,
+    /// The brain factory refuses every call.
+    refuse: bool,
 }
 
 impl Default for Setup {
@@ -33,6 +35,7 @@ impl Default for Setup {
             rtp_timeout: Duration::from_secs(10),
             allow: None,
             max_calls: usize::MAX,
+            refuse: false,
         }
     }
 }
@@ -59,8 +62,13 @@ async fn chirp_sip(script: Script, setup: Setup) -> SocketAddr {
             .allow
             .map(|list| chirp::sip::parse_allow(list).unwrap()),
     };
-    let addrs = chirp::sip::start(config, shared, move || {
-        OpenAiBrain::new(http.clone(), &brain_url, "mock", "mock", None)
+    let refuse = setup.refuse;
+    let addrs = chirp::sip::start(config, shared, move |request| {
+        assert!(
+            request.query.contains_key("call_id"),
+            "the INVITE reaches the factory"
+        );
+        (!refuse).then(|| OpenAiBrain::new(http.clone(), &brain_url, "mock", "mock", None))
     })
     .await
     .unwrap();
@@ -291,4 +299,30 @@ async fn a_call_over_the_limit_is_refused() {
         .await
         .expect("an answer");
     assert!(refused.starts_with("SIP/2.0 503"), "{refused}");
+}
+
+/// An INVITE the brain factory refuses gets a 403, and no call starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_the_brain_factory_refuses_is_forbidden() {
+    let chirp = chirp_sip(
+        Script::default(),
+        Setup {
+            refuse: true,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let phone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let from = phone.local_addr().unwrap();
+    phone
+        .send_to(
+            invite(chirp, from, "no@1", "a", 1, 40_012).as_bytes(),
+            chirp,
+        )
+        .await
+        .unwrap();
+    let refused = final_response(&phone, Duration::from_secs(5))
+        .await
+        .expect("an answer");
+    assert!(refused.starts_with("SIP/2.0 403"), "{refused}");
 }

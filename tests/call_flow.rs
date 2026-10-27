@@ -11,6 +11,7 @@ use chirp::elevenlabs::ElevenLabs;
 use chirp::endpoint::TurnModel;
 use chirp::mock::{self, Script};
 use chirp::openai::OpenAiBrain;
+use chirp::request::CallRequest;
 use chirp::turn_taking::Policy;
 use chirp::vad::VadModel;
 
@@ -20,13 +21,14 @@ fn root() -> &'static Path {
 
 /// A chirp server on the given mocks; returns its call URL.
 async fn chirp_on(script: Script) -> String {
-    chirp_with(script, |brain| brain).await
+    chirp_with(script, |_, brain| Some(brain)).await
 }
 
-/// As `chirp_on`, with the mock-backed brain wrapped by `wrap`.
+/// As `chirp_on`, with the mock-backed brain wrapped (or the call refused)
+/// by `wrap`.
 async fn chirp_with<B: Brain>(
     script: Script,
-    wrap: impl Fn(OpenAiBrain) -> B + Clone + Send + Sync + 'static,
+    wrap: impl Fn(&CallRequest, OpenAiBrain) -> Option<B> + Clone + Send + Sync + 'static,
 ) -> String {
     let mocks = mock::start(script).await.unwrap();
     let shared = Shared {
@@ -40,14 +42,11 @@ async fn chirp_with<B: Brain>(
     };
     let http = reqwest::Client::new();
     let brain_url = format!("http://{mocks}/v1");
-    let router = chirp::server::router(shared, move || {
-        wrap(OpenAiBrain::new(
-            http.clone(),
-            &brain_url,
-            "mock",
-            "mock",
-            None,
-        ))
+    let router = chirp::server::router(shared, move |request| {
+        wrap(
+            request,
+            OpenAiBrain::new(http.clone(), &brain_url, "mock", "mock", None),
+        )
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/v1/calls", listener.local_addr().unwrap());
@@ -197,7 +196,7 @@ impl Brain for FailingPoll {
 /// A failed unprompted poll is retried later; it doesn't end the call.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_unprompted_poll_does_not_end_the_call() {
-    let url = chirp_with(Script::default(), FailingPoll).await;
+    let url = chirp_with(Script::default(), |_, brain| Some(FailingPoll(brain))).await;
     // Quiet long enough for the poll to fail at least twice, then a question.
     let mut audio = silence(Duration::from_secs(5));
     audio.extend(question());
@@ -239,4 +238,28 @@ async fn a_backlog_of_audio_is_sent_in_a_few_messages() {
         .expect("a final transcript");
     assert_eq!(transcript.1["text"], script.transcript);
     assert!(outcome.first_audio.is_some(), "the turn was never answered");
+}
+
+/// A brain factory that refuses a call refuses it before it starts: no token,
+/// no call; the right token, in the query as a browser sends it, gets one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_the_brain_factory_refuses_never_starts() {
+    let url = chirp_with(Script::default(), |request, brain| {
+        request.has_token("s3cret").then_some(brain)
+    })
+    .await;
+    match tokio_tungstenite::connect_async(url.as_str()).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), 403)
+        }
+        other => panic!("a call without a token was not refused: {other:?}"),
+    }
+    let wrong = format!("{url}?token=nope");
+    assert!(tokio_tungstenite::connect_async(wrong.as_str())
+        .await
+        .is_err());
+    let right = format!("{url}?token=s3cret");
+    tokio_tungstenite::connect_async(right.as_str())
+        .await
+        .expect("a call with the token");
 }

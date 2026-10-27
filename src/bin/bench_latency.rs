@@ -77,8 +77,14 @@ async fn main() -> Result<()> {
     };
     let http = reqwest::Client::new();
     let brain_url = format!("http://{mocks}/v1");
-    let router = chirp::server::router(shared, move || {
-        OpenAiBrain::new(http.clone(), &brain_url, "mock", "mock", None)
+    let router = chirp::server::router(shared, move |_| {
+        Some(OpenAiBrain::new(
+            http.clone(),
+            &brain_url,
+            "mock",
+            "mock",
+            None,
+        ))
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("ws://{}/v1/calls", listener.local_addr()?);
