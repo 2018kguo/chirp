@@ -155,7 +155,15 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
                 if !state.quiet() {
                     continue;
                 }
-                let Some(reply) = brain.unprompted().await? else { continue };
+                let reply = match brain.unprompted().await {
+                    Ok(Some(reply)) => reply,
+                    Ok(None) => continue,
+                    // A poll that failed is retried on the next tick; the call goes on.
+                    Err(error) => {
+                        tracing::warn!(%error, "unprompted poll failed");
+                        continue;
+                    }
+                };
                 let actions = state.on(Input::UnpromptedReady);
                 if actions.contains(&Action::SpeakUnprompted) {
                     generation += 1;

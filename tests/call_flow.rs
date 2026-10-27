@@ -4,6 +4,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use chirp::brain::{Brain, Reply, Utterance};
 use chirp::call::{Shared, SpeechPolicy};
 use chirp::client::{self, Outcome};
 use chirp::elevenlabs::ElevenLabs;
@@ -19,6 +20,14 @@ fn root() -> &'static Path {
 
 /// A chirp server on the given mocks; returns its call URL.
 async fn chirp_on(script: Script) -> String {
+    chirp_with(script, |brain| brain).await
+}
+
+/// As `chirp_on`, with the mock-backed brain wrapped by `wrap`.
+async fn chirp_with<B: Brain>(
+    script: Script,
+    wrap: impl Fn(OpenAiBrain) -> B + Clone + Send + Sync + 'static,
+) -> String {
     let mocks = mock::start(script).await.unwrap();
     let shared = Shared {
         vad: VadModel::spawn(&root().join("models/silero_vad.onnx")).unwrap(),
@@ -30,7 +39,13 @@ async fn chirp_on(script: Script) -> String {
     let http = reqwest::Client::new();
     let brain_url = format!("http://{mocks}/v1");
     let router = chirp::server::router(shared, move || {
-        OpenAiBrain::new(http.clone(), &brain_url, "mock", "mock", None)
+        wrap(OpenAiBrain::new(
+            http.clone(),
+            &brain_url,
+            "mock",
+            "mock",
+            None,
+        ))
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/v1/calls", listener.local_addr().unwrap());
@@ -161,5 +176,33 @@ async fn an_unanswered_commit_does_not_leave_the_turn_hanging() {
     assert!(
         wait < 3_500.0,
         "closed out {wait:.0} ms after the turn ended"
+    );
+}
+
+/// A brain whose unprompted poll always fails.
+struct FailingPoll(OpenAiBrain);
+
+impl Brain for FailingPoll {
+    async fn reply(&self, utterance: Utterance) -> anyhow::Result<Reply> {
+        self.0.reply(utterance).await
+    }
+
+    async fn unprompted(&self) -> anyhow::Result<Option<Reply>> {
+        anyhow::bail!("network down")
+    }
+}
+
+/// A failed unprompted poll is retried later; it doesn't end the call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_unprompted_poll_does_not_end_the_call() {
+    let url = chirp_with(Script::default(), FailingPoll).await;
+    // Quiet long enough for the poll to fail at least twice, then a question.
+    let mut audio = silence(Duration::from_secs(5));
+    audio.extend(question());
+    audio.extend(silence(Duration::from_secs(3)));
+    let outcome = client::play(&url, audio).await.unwrap();
+    assert!(
+        outcome.first_audio.is_some(),
+        "the question after the failed polls went unanswered"
     );
 }
