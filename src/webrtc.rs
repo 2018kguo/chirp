@@ -16,8 +16,7 @@
 //!   arrives and paces it out every 20 ms; an `interrupt` drops what has not
 //!   been played. Codec work runs on every core, not on the hubs.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -265,7 +264,7 @@ struct Session {
     events: VecDeque<String>,
     /// Source addresses routed to this session, removed with it.
     sources: Vec<SocketAddr>,
-    /// The deadline in the heap for this session, if one is.
+    /// This session's entry in the deadline set, if it has one.
     scheduled: Option<Instant>,
 }
 
@@ -397,14 +396,14 @@ async fn hub(
     let mut sessions: HashMap<u64, Session> = HashMap::new();
     let mut routes: HashMap<SocketAddr, u64> = HashMap::new();
     let mut by_ufrag: HashMap<String, u64> = HashMap::new();
-    // Session deadlines; an entry is stale if its session has moved its own.
-    let mut deadlines: BinaryHeap<Reverse<(Instant, u64)>> = BinaryHeap::new();
+    // Each session's next deadline, exactly one entry per session: moving a
+    // deadline replaces its entry, so this stays the size of the session set.
+    let mut deadlines: BTreeSet<(Instant, u64)> = BTreeSet::new();
     let mut buffer = vec![0u8; 2000];
     loop {
-        let next = deadlines.peek().map_or_else(
-            || Instant::now() + Duration::from_secs(1),
-            |Reverse((at, _))| *at,
-        );
+        let next = deadlines
+            .first()
+            .map_or_else(|| Instant::now() + Duration::from_secs(1), |(at, _)| *at);
         let touched = tokio::select! {
             session = new_sessions.recv() => {
                 let Some(new) = session else { return };
@@ -456,22 +455,19 @@ async fn hub(
             }
             _ = tokio::time::sleep_until(next.into()) => {
                 let now = Instant::now();
-                while let Some(Reverse((at, id))) = deadlines.peek().copied() {
+                while let Some(&(at, id)) = deadlines.first() {
                     if at > now {
                         break;
                     }
-                    deadlines.pop();
+                    deadlines.pop_first();
                     let Some(session) = sessions.get_mut(&id) else { continue };
-                    if session.scheduled != Some(at) {
-                        continue; // stale: the session moved its deadline
-                    }
                     session.scheduled = None;
                     if session.rtc.is_alive() {
                         let _ = session.rtc.handle_input(Input::Timeout(now));
                     }
                     reschedule(id, session, &socket, &mut deadlines);
                     if !session.rtc.is_alive() {
-                        remove(id, &mut sessions, &mut routes, &mut by_ufrag);
+                        remove(id, &mut sessions, &mut routes, &mut by_ufrag, &mut deadlines);
                     }
                 }
                 None
@@ -481,7 +477,13 @@ async fn hub(
             if let Some(session) = sessions.get_mut(&id) {
                 reschedule(id, session, &socket, &mut deadlines);
                 if !session.rtc.is_alive() {
-                    remove(id, &mut sessions, &mut routes, &mut by_ufrag);
+                    remove(
+                        id,
+                        &mut sessions,
+                        &mut routes,
+                        &mut by_ufrag,
+                        &mut deadlines,
+                    );
                 }
             }
         }
@@ -492,12 +494,14 @@ fn reschedule(
     id: u64,
     session: &mut Session,
     socket: &UdpSocket,
-    deadlines: &mut BinaryHeap<Reverse<(Instant, u64)>>,
+    deadlines: &mut BTreeSet<(Instant, u64)>,
 ) {
     let at = session.drive(socket);
     if session.scheduled != Some(at) {
-        session.scheduled = Some(at);
-        deadlines.push(Reverse((at, id)));
+        if let Some(previous) = session.scheduled.replace(at) {
+            deadlines.remove(&(previous, id));
+        }
+        deadlines.insert((at, id));
     }
 }
 
@@ -508,8 +512,12 @@ fn remove(
     sessions: &mut HashMap<u64, Session>,
     routes: &mut HashMap<SocketAddr, u64>,
     by_ufrag: &mut HashMap<String, u64>,
+    deadlines: &mut BTreeSet<(Instant, u64)>,
 ) {
     if let Some(session) = sessions.remove(&id) {
+        if let Some(at) = session.scheduled {
+            deadlines.remove(&(at, id));
+        }
         for source in &session.sources {
             routes.remove(source);
         }

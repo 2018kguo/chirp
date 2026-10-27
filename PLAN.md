@@ -274,3 +274,9 @@ numbers that matter, not a port.
   at load 16.5 (CPU-bound, as WebSocket is at ~1,000). CPU per call-second
   by calls, WebRTC 100/300/600/800: 14.2 / 13.8 / 13.0 / 12.9; SIP
   100/300/600/1,000: 10.6 / 10.6 / 10.4 / 10.4. Flat: each call costs O(1).
+- **Memory per call by transport (Oct 27 2026, live heap, 50 calls):**
+  WebSocket 129 KB, SIP 128 KB, WebRTC 249 KB. dhat puts WebRTC's extra
+  ~120 KB in str0m's per-session DTLS/SRTP/SCTP state (its audio buffers are
+  already small: 50-packet send buffer, 15-packet reorder window, no stats
+  or BWE) plus libopus encoder/decoder (C allocations, not in these
+  numbers). Not chased further: 250 MB at 1,000 calls.
