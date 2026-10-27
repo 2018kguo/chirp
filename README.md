@@ -88,11 +88,13 @@ cargo run --release --bin call_client -- ws://127.0.0.1:7861/v1/calls question.w
 
 Building needs cmake (libopus is compiled in).
 
-`GET /metrics` serves Prometheus counters: calls active, started, refused
-(by reason) and failed; turns by what ended them; and the mean time from
-the end of a turn to the reply's first audio and Smart Turn's queue wait.
-`GET /health` answers `ok`. Neither needs `CHIRP_TOKEN`. A token sent as `?token=` can end up in
-proxy access logs; prefer the header where the client can set one.
+`GET /metrics` serves Prometheus metrics: calls active, started, refused
+(by reason) and failed; turns by what ended them; and histograms (5 ms to
+10 s buckets) of the time from the end of a turn to the reply's first
+audio and of Smart Turn's queue wait, for percentiles with
+`histogram_quantile`. `GET /health` answers `ok`. Neither needs
+`CHIRP_TOKEN`. A token sent as `?token=` can end up in proxy access logs;
+prefer the header where the client can set one.
 
 ## Transports
 
