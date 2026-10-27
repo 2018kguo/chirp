@@ -12,7 +12,7 @@
 //!   lookup. Sessions are driven only when a packet, a message or their own
 //!   deadline arrives. `CHIRP_RTC_SHARDS` hubs run on consecutive ports.
 //! - each call's **media task** decodes the caller's Opus for `call::run`,
-//!   fills the gaps browsers leave in silence (DTX), encodes the reply as it
+//!   fills gaps where a caller stops sending, encodes the reply as it
 //!   arrives and paces it out every 20 ms; an `interrupt` drops what has not
 //!   been played. Codec work runs on every core, not on the hubs.
 
@@ -228,8 +228,8 @@ fn media(
                 }
                 _ = pace.tick() => {
                     let now = Instant::now();
-                    // Browsers send (almost) nothing while the caller is
-                    // silent (Opus DTX), but a turn ends only after enough
+                    // A caller can stop sending (a muted track, lost
+                    // packets, Opus DTX), but a turn ends only after enough
                     // quiet audio: fill the gap, in real time.
                     if let Some(last) = last_media {
                         let from = last.max(filled_until);
