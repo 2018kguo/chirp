@@ -20,6 +20,7 @@ use crate::brain::{Brain, Reply, Speakable, Utterance};
 use crate::call_state::{Action, CallState, Input};
 use crate::elevenlabs::{ElevenLabs, Transcript};
 use crate::endpoint::TurnModel;
+use crate::metrics;
 use crate::turn_taking::{Policy, TurnEvent, TurnTaker};
 use crate::vad::{CallVad, VadModel};
 
@@ -79,7 +80,9 @@ where
     B: Brain,
     S: Stream<Item = Bytes> + Unpin + Send,
 {
+    metrics::CALLS.add();
     if let Err(error) = run_inner(audio, to_caller, shared, Arc::new(brain)).await {
+        metrics::CALL_ERRORS.add();
         tracing::warn!(%error, "call ended with an error");
     }
 }
@@ -257,6 +260,7 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
                 }
                 Action::TurnEnded(by) => {
                     ended_at = Some(Instant::now());
+                    metrics::turn_ended(by);
                     let _ = to_client
                         .send(event(
                             json!({ "type": "turn_end", "by": format!("{by:?}") }),
@@ -305,6 +309,7 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
 
 async fn report(result: Result<()>, to_client: &mpsc::Sender<ToCaller>) {
     if let Err(error) = result {
+        metrics::REPLY_ERRORS.add();
         tracing::warn!(%error, "reply failed");
         let _ = to_client
             .send(ToCaller::Event(
@@ -332,6 +337,7 @@ async fn speak(
             if first {
                 first = false;
                 if let Some(start) = turn_ended_at {
+                    metrics::FIRST_AUDIO.record(start.elapsed());
                     let ms = start.elapsed().as_millis() as u64;
                     let _ = forward_to
                         .send(ToCaller::Event(
