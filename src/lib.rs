@@ -1,11 +1,4 @@
-//! chirp: a voice engine that serves many calls per process.
-//!
-//! Each call is a WebSocket carrying 16 kHz mono PCM16 in and out. Tokio does
-//! only I/O; model inference runs on dedicated threads, where one Silero VAD
-//! session per thread scores every call's audio in batches (`vad`) and Smart
-//! Turn decides end of turn when the caller pauses (`endpoint`, `turn`).
-//! Speech-to-text and text-to-speech are streaming services (`elevenlabs`);
-//! the answer comes from a [`brain::Brain`].
+#![doc = include_str!("../README.md")]
 
 pub mod brain;
 pub mod call;

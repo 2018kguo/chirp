@@ -55,7 +55,8 @@ numbers that matter, not a port.
   execution providers, earlier/overlapped decisions); Opus in and out.
 - **3. Hardening.** Doubling + soak + fuzz gates in CI; graceful drain on
   deploy; backpressure for slow clients.
-- **4. Adoption, then release** (only when the owner says so).
+- **4. Release and adoption.** Public since Oct 27 2026. The first product
+  brain lives in its product's repo and depends on this crate by git revision.
 
 ## Findings log
 

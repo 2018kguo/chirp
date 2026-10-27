@@ -8,7 +8,7 @@
 //! - incomplete clips: false cut-offs (ended by the model instead of waiting);
 //! - any clip: premature ends (a turn ended, then the speaker kept talking).
 //!
-//!     cargo run --release --bin bench_turns -- [language dir, default eng] [limit]
+//! `cargo run --release --bin bench_turns -- [language dir, default eng] [limit]`
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
