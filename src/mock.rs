@@ -39,6 +39,9 @@ pub struct Script {
     pub stt_drop_after_commit: Option<Duration>,
     /// The first this many commits get no answer at all.
     pub stt_unanswered_commits: usize,
+    /// End the session (`queue_overflow`) when more than this many messages
+    /// arrive within 100 ms, as ElevenLabs does with a flood of small chunks.
+    pub stt_max_messages_per_100ms: Option<usize>,
 }
 
 impl Default for Script {
@@ -53,6 +56,7 @@ impl Default for Script {
             tts_chunk_gap: Duration::from_millis(50),
             stt_drop_after_commit: None,
             stt_unanswered_commits: 0,
+            stt_max_messages_per_100ms: None,
         }
     }
 }
@@ -117,6 +121,7 @@ async fn stt(State(script): State<Script>, upgrade: WebSocketUpgrade) -> impl In
         let _ = send.send(json!({ "message_type": "session_started" }));
         let (dropped, mut drop_now) = mpsc::unbounded_channel::<()>();
         let mut unanswered = script.stt_unanswered_commits;
+        let mut recent = std::collections::VecDeque::new();
         loop {
             let message = tokio::select! {
                 message = stream.next() => message,
@@ -124,6 +129,18 @@ async fn stt(State(script): State<Script>, upgrade: WebSocketUpgrade) -> impl In
             };
             let Some(Ok(Message::Text(text))) = message else { break };
             let Ok(message) = serde_json::from_str::<Value>(&text) else { continue };
+            if let Some(limit) = script.stt_max_messages_per_100ms {
+                let now = tokio::time::Instant::now();
+                recent.push_back(now);
+                while recent.front().is_some_and(|at| now - *at > Duration::from_millis(100)) {
+                    recent.pop_front();
+                }
+                if recent.len() > limit {
+                    let _ = send.send(json!({ "message_type": "queue_overflow", "error": "audio data is being sent too frequently" }));
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    break;
+                }
+            }
             if message["commit"] == true && unanswered > 0 {
                 unanswered -= 1;
             } else if message["commit"] == true {

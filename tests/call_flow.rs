@@ -206,3 +206,35 @@ async fn a_failed_unprompted_poll_does_not_end_the_call() {
         "the question after the failed polls went unanswered"
     );
 }
+
+/// Audio that queued while chirp was held up reaches speech-to-text in a few
+/// messages, not one per frame: a flood of small chunks ends the session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backlog_of_audio_is_sent_in_a_few_messages() {
+    let script = Script {
+        stt_max_messages_per_100ms: Some(20),
+        ..Script::default()
+    };
+    let url = chirp_on(script.clone()).await;
+    let mut audio = question();
+    audio.extend(silence(Duration::from_secs(8)));
+    // One second live, then the next six arrive at once.
+    let outcome =
+        client::play_with_backlog(&url, audio, Duration::from_secs(1)..Duration::from_secs(7))
+            .await
+            .unwrap();
+    let errors: Vec<_> = outcome
+        .events
+        .iter()
+        .filter(|(_, e)| e["type"] == "error")
+        .map(|(_, e)| e["message"].to_string())
+        .collect();
+    assert!(errors.is_empty(), "the session failed: {errors:?}");
+    let transcript = outcome
+        .events
+        .iter()
+        .find(|(_, e)| e["type"] == "transcript" && e["final"] == true)
+        .expect("a final transcript");
+    assert_eq!(transcript.1["text"], script.transcript);
+    assert!(outcome.first_audio.is_some(), "the turn was never answered");
+}

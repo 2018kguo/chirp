@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -24,6 +24,8 @@ use crate::vad::{CallVad, VadModel};
 
 /// How often a quiet call asks its brain for an unprompted reply.
 const UNPROMPTED_POLL: Duration = Duration::from_secs(2);
+/// At most 1 s of 16 kHz PCM16 per speech-to-text message when catching up.
+const MAX_COALESCED_BYTES: usize = 32_000;
 /// A commit the provider never answers resolves as empty, so one lost
 /// reply can't leave the turn unanswered and the call deaf.
 const COMMIT_DEADLINE: Duration = Duration::from_secs(3);
@@ -104,6 +106,10 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
     let mut generation = 0u64;
     // Reused for every frame: the frame path allocates nothing of its own.
     let mut samples: Vec<f32> = Vec::with_capacity(320);
+    // Only used when frames queued up; empty (and unallocated) otherwise.
+    let mut backlog: Vec<u8> = Vec::new();
+    // The caller hung up while a backlog was being read: finish it, then stop.
+    let mut hung_up = false;
     let mut unprompted = tokio::time::interval(UNPROMPTED_POLL);
     // Last commit sent or answered: the deadline runs from here.
     let mut commit_progress = tokio::time::Instant::now();
@@ -113,9 +119,30 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
             message = client_rx.next() => {
                 let Some(Ok(message)) = message else { break };
                 let Message::Binary(pcm) = message else { continue };
+                // Frames that queued while this loop was held up (a slow
+                // host) go to speech-to-text as one message: ElevenLabs ends
+                // a session flooded with hundreds of 20 ms messages at once.
+                backlog.clear();
+                while backlog.len() + pcm.len() < MAX_COALESCED_BYTES {
+                    match client_rx.next().now_or_never() {
+                        Some(Some(Ok(Message::Binary(more)))) => {
+                            if backlog.is_empty() {
+                                backlog.extend_from_slice(&pcm);
+                            }
+                            backlog.extend_from_slice(&more);
+                        }
+                        Some(Some(Ok(_))) => {}
+                        Some(_) => {
+                            hung_up = true;
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                let pcm: &[u8] = if backlog.is_empty() { &pcm } else { &backlog };
                 samples.clear();
                 samples.extend(pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0));
-                transcriber.audio(&pcm).await?;
+                transcriber.audio(pcm).await?;
                 let mut actions = Vec::new();
                 for turn_event in turns.push(&samples).await? {
                     if let TurnEvent::Assessed { probability } = turn_event {
@@ -229,6 +256,9 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
                 }
                 Action::SpeakUnprompted => {}
             }
+        }
+        if hung_up {
+            break;
         }
     }
     drop(speaking);

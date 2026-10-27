@@ -193,3 +193,17 @@ numbers that matter, not a port.
   a spare pool would still handshake once per reply. Multi-context TTS
   would save the handshake (~1 ms CPU each, ~1.5% of CPU at 1,000 calls)
   at the price of shared fate across calls: not worth it.
+- **A stall used to end the call; now the backlog is coalesced.** Under heavy
+  host load the call loop fell ~7 s behind, then forwarded the queued 20 ms
+  frames to ElevenLabs one message each (~350 in 60 ms, with a pause commit
+  mid-burst), and ElevenLabs ended the session: `queue_overflow`, "audio data
+  is being sent too frequently". Reproduced by freezing chirp (SIGSTOP) for
+  7 s mid-call; a logging proxy recorded the exact send pattern, and replaying
+  it against ElevenLabs failed 3 of 3. The same audio and timing with each
+  backlog merged into one message (capped at 1 s) passed 3 of 3. Bursts alone,
+  long bursts and idle-then-burst all passed on a fresh session, so the
+  trigger is the flood after a session has been streaming. Fix: the call loop
+  reads frames already waiting and sends them as one message, up to 1 s.
+  Frozen live calls: 4 of 4 answered (were 2 of 2 killed). The mock STT can
+  enforce a message rate (`stt_max_messages_per_100ms`) for the regression
+  test `call_flow::a_backlog_of_audio_is_sent_in_a_few_messages`.

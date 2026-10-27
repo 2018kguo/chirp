@@ -44,6 +44,16 @@ pub async fn call(url: &str, speech: &[i16], tail: Duration) -> Result<Outcome> 
 /// Plays `audio` at real-time pace, hangs up, and waits for the server to
 /// close the connection.
 pub async fn play(url: &str, audio: Vec<i16>) -> Result<Outcome> {
+    play_with_backlog(url, audio, Duration::ZERO..Duration::ZERO).await
+}
+
+/// As `play`, but the audio in `backlog` (call time) is sent all at once, the
+/// way it reaches a server that fell behind and then caught up.
+pub async fn play_with_backlog(
+    url: &str,
+    audio: Vec<i16>,
+    backlog: std::ops::Range<Duration>,
+) -> Result<Outcome> {
     let (socket, _) = tokio_tungstenite::connect_async(url)
         .await
         .context("connect")?;
@@ -56,8 +66,10 @@ pub async fn play(url: &str, audio: Vec<i16>) -> Result<Outcome> {
     let started = Instant::now();
     let sender = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(20));
-        for frame in frames {
-            tick.tick().await;
+        for (index, frame) in frames.into_iter().enumerate() {
+            if !backlog.contains(&(Duration::from_millis(20) * index as u32)) {
+                tick.tick().await;
+            }
             if sink.send(Message::Binary(frame.into())).await.is_err() {
                 break;
             }
