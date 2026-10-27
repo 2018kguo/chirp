@@ -128,8 +128,6 @@ pub fn render(active: usize) -> String {
             &TURN_QUEUE,
         ),
     ] {
-        let seconds = timing.micros.load(Relaxed) as f64 / 1e6;
-        let count = timing.count.load(Relaxed);
         let _ = writeln!(
             out,
             "# HELP chirp_{name} {help}\n# TYPE chirp_{name} histogram"
@@ -139,6 +137,10 @@ pub fn render(active: usize) -> String {
             cumulative += bucket.load(Relaxed);
             let _ = writeln!(out, "chirp_{name}_bucket{{le=\"{bound}\"}} {cumulative}");
         }
+        // After the buckets: `record` counts first, so +Inf is never below
+        // a finite bucket.
+        let seconds = timing.micros.load(Relaxed) as f64 / 1e6;
+        let count = timing.count.load(Relaxed);
         let _ = writeln!(
             out,
             "chirp_{name}_bucket{{le=\"+Inf\"}} {count}\nchirp_{name}_sum {seconds}\nchirp_{name}_count {count}"
