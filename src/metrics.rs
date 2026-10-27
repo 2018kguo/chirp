@@ -137,10 +137,10 @@ pub fn render(active: usize) -> String {
             cumulative += bucket.load(Relaxed);
             let _ = writeln!(out, "chirp_{name}_bucket{{le=\"{bound}\"}} {cumulative}");
         }
-        // After the buckets: `record` counts first, so +Inf is never below
-        // a finite bucket.
+        // Relaxed reads of separate atomics: +Inf (the count) is held at or
+        // above the finite buckets read just before it.
         let seconds = timing.micros.load(Relaxed) as f64 / 1e6;
-        let count = timing.count.load(Relaxed);
+        let count = timing.count.load(Relaxed).max(cumulative);
         let _ = writeln!(
             out,
             "chirp_{name}_bucket{{le=\"+Inf\"}} {count}\nchirp_{name}_sum {seconds}\nchirp_{name}_count {count}"

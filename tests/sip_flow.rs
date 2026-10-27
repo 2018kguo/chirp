@@ -369,6 +369,16 @@ async fn an_answer_is_resent_until_it_is_acked() {
         .await
         .expect("an answer");
     assert!(first.starts_with("SIP/2.0 200"), "{first}");
+    // An ACK without chirp's To tag (someone who knows only the Call-ID)
+    // doesn't count, and neither does such a BYE.
+    let forged = ack(chirp, from, &first).replace(";tag=", ";nottag=");
+    phone.send_to(forged.as_bytes(), chirp).await.unwrap();
+    let forged_bye = forged.replacen("ACK ", "BYE ", 1).replace("1 ACK", "2 BYE");
+    phone.send_to(forged_bye.as_bytes(), chirp).await.unwrap();
+    let refused = final_response(&phone, Duration::from_millis(400))
+        .await
+        .expect("an answer to the BYE");
+    assert!(refused.starts_with("SIP/2.0 481"), "{refused}");
     // Not ACKed: the same answer comes again, T1 (500 ms) later.
     let again = final_response(&phone, Duration::from_millis(1500))
         .await

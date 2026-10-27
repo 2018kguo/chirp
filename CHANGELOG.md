@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1 (2026-10-27)
+
+- **SIP:** ACK and BYE must carry chirp's To tag (sent only in the 200
+  OK), so someone who knows only a Call-ID can't stop an answer's
+  retransmission or end a call; a BYE without it gets 481. A CANCEL is
+  always too late (every INVITE is answered at once) and no longer ends
+  the call (RFC 3261 9.2).
+- **Metrics:** a histogram's `+Inf` and `_count` are never below a finite
+  bucket, even while timings are being recorded.
+
+
 ## 0.3.0 (2026-10-27)
 
 ### SIP
