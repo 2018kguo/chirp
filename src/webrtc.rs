@@ -207,6 +207,9 @@ fn media(
         // The caller's audio, written here and split off per packet.
         let mut pcm = BytesMut::new();
         let mut last_media: Option<Instant> = None;
+        // The caller's encoder said it went quiet: a header-only Opus packet
+        // starts DTX (browsers send the first, then nothing).
+        let mut in_dtx = false;
         let mut filled_until = Instant::now();
         let mut rtp_time = 0u64;
         let mut events = Vec::new();
@@ -225,6 +228,7 @@ fn media(
                     // queueing it without bound.
                     let _ = audio_in.try_send(pcm.split().freeze());
                     last_media = Some(Instant::now());
+                    in_dtx = opus.len() <= 2;
                 }
                 _ = pace.tick() => {
                     let now = Instant::now();
@@ -234,7 +238,10 @@ fn media(
                     if let Some(last) = last_media {
                         let from = last.max(filled_until);
                         let gap = now.saturating_duration_since(from);
-                        if gap >= SILENCE_AFTER {
+                        // In DTX the silence is known: fill it at once,
+                        // without waiting out network jitter.
+                        let wait = if in_dtx { Duration::ZERO } else { SILENCE_AFTER };
+                        if gap >= wait {
                             let frames = (gap.as_millis() / 20) as usize;
                             pcm.resize(FRAME * 2 * frames, 0);
                             let _ = audio_in.try_send(pcm.split().freeze());

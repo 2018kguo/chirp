@@ -137,7 +137,7 @@ pub fn speech_end(speech: &[i16]) -> Duration {
 }
 
 /// Plays `audio` over WebRTC to `url` (`POST /v1/webrtc`) like a browser:
-/// Opus in 20 ms frames, nothing sent while silent (DTX), events on an
+/// Opus in 20 ms frames, little sent while silent (DTX), events on an
 /// `events` data channel. Hangs up when the audio ends.
 pub async fn play_webrtc(url: &str, audio: Vec<i16>) -> Result<Outcome> {
     let frames = encode_for_webrtc(&audio)?;
@@ -145,20 +145,28 @@ pub async fn play_webrtc(url: &str, audio: Vec<i16>) -> Result<Outcome> {
     play_webrtc_encoded(url, frames, count, speech_end(&audio)).await
 }
 
-/// `audio` as the Opus frames a browser would send: `None` for silence,
-/// which it doesn't send (DTX). Encode once, play to many callers.
+/// `audio` as the Opus frames a browser would send (`None`: nothing sent).
+/// Like Chrome: libopus with DTX, and of the header-only packets it makes
+/// in silence, only the first is sent, to say DTX has begun. Encode once,
+/// play to many callers.
 pub fn encode_for_webrtc(audio: &[i16]) -> Result<std::sync::Arc<[Option<bytes::Bytes>]>> {
     let mut encoder = opus::Encoder::new(16_000, opus::Channels::Mono, opus::Application::Voip)?;
+    encoder.set_dtx(true)?;
     let mut packet = vec![0u8; 1500];
+    let mut in_dtx = false;
     audio
         .chunks(320)
         .map(|frame| {
             let mut padded = [0i16; 320];
             padded[..frame.len()].copy_from_slice(frame);
-            if padded.iter().all(|sample| *sample == 0) {
-                return Ok(None);
-            }
             let length = encoder.encode(&padded, &mut packet)?;
+            if length <= 2 {
+                if std::mem::replace(&mut in_dtx, true) {
+                    return Ok(None);
+                }
+            } else {
+                in_dtx = false;
+            }
             Ok(Some(bytes::Bytes::copy_from_slice(&packet[..length])))
         })
         .collect()
@@ -251,7 +259,6 @@ pub async fn play_webrtc_encoded(
             }
             _ = tick.tick() => {
                 let Some(frame) = frames.next() else { break };
-                // Like a browser's Opus with DTX: silence is not sent.
                 if let (Some(opus), Some(writer)) = (frame, rtc.writer(mid)) {
                     let pt = writer.payload_params().find(|p| p.spec().codec == Codec::Opus).map(|p| p.pt());
                     if let Some(pt) = pt {
