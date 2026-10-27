@@ -25,6 +25,7 @@ dhat = { version = "0.3", optional = true }
 mimalloc = { version = "0.1", optional = true, default-features = false }
 futures = "0.3"
 ort = { version = "=2.0.0-rc.15", features = ["download-binaries"] }
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 reqwest = { version = "0.12", default-features = false, features = [

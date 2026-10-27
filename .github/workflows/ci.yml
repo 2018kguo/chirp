@@ -19,7 +19,7 @@ jobs:
             target
           key: cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-
-      - run: ./models/fetch.sh
+      - run: cargo run --release --locked --bin fetch_models
       - run: cargo fmt --check
       - run: cargo clippy --release --all-targets --locked -- -D warnings
       - uses: astral-sh/setup-uv@v5

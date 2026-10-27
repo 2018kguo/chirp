@@ -207,6 +207,7 @@ dependencies = [
  "mimalloc",
  "ort",
  "reqwest",
+ "ring",
  "rustfft",
  "rustls",
  "rustls-native-certs",

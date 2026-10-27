@@ -44,7 +44,7 @@ Turn decisions match Pipecat's: speculative transcript commits changed 0 of
   tells the client to flush playback. The brain decides what happens to the
   work behind it.
 - **Checked against the reference.** The models run through ONNX Runtime on
-  the files Pipecat ships (`models/fetch.sh` pins them by checksum).
+  the files Pipecat ships, pinned by URL and checksum (`src/models.rs`).
   `tests/vad_parity.rs` and `tests/turn_parity.rs` compare framing, batching,
   features and probabilities with Pipecat's Python outputs.
 - **Checked over every interleaving.** Each call's decisions (commit,
@@ -59,7 +59,6 @@ Turn decisions match Pipecat's: speculative transcript commits changed 0 of
 ## Run
 
 ```sh
-./models/fetch.sh
 ELEVENLABS_API_KEY=... CHIRP_BRAIN_KEY=... CHIRP_BRAIN_MODEL=gpt-4.1-mini cargo run --release
 cargo run --release --bin call_client -- ws://127.0.0.1:7861/v1/calls question.wav reply.wav
 ```
@@ -73,12 +72,14 @@ cargo run --release --bin call_client -- ws://127.0.0.1:7861/v1/calls question.w
 | `CHIRP_SYSTEM_PROMPT` | none | |
 | `CHIRP_VAD_THREADS` | cores / 4, at least 2 | |
 | `CHIRP_TURN_THREADS` | cores − 2 | |
+| `CHIRP_MODELS_DIR` | `models` | missing models are downloaded here at startup |
 | `PORT` | 7861 | |
 
 ## Your own brain
 
 To answer with something other than a chat-completions API, implement
-`Brain` and serve calls with `chirp::call::run`:
+`Brain` and hand `chirp::server::serve` a function that makes one per call.
+It reads the same environment variables:
 
 ```rust
 use chirp::brain::{Brain, Reply, ReplyEvent, Utterance};
@@ -92,7 +93,14 @@ impl Brain for Echo {
         Ok(Box::pin(stream::iter([Ok(ReplyEvent::Text(said))])))
     }
 }
+
+# async fn run() -> anyhow::Result<()> {
+chirp::server::serve(|| Echo).await
+# }
 ```
+
+`chirp::server::router` gives you the routes instead, to mount in your own
+axum app.
 
 `ReplyEvent::Progress` speaks a short status line (for example while a tool
 runs), at most once each. `Brain::unprompted` lets the brain speak something
@@ -109,9 +117,10 @@ They saturate it on purpose.
 
 ## Models
 
-`models/fetch.sh` downloads [Silero VAD](https://github.com/snakers4/silero-vad)
+chirp downloads [Silero VAD](https://github.com/snakers4/silero-vad)
 (MIT) and [Smart Turn v3.2](https://huggingface.co/pipecat-ai/smart-turn-v3)
-(BSD-2-Clause). The turn-taking test set used by `bench_turns` is
+(BSD-2-Clause) on first start; `cargo run --bin fetch_models` fetches them
+for the tests. The turn-taking test set used by `bench_turns` is
 [Pipecat's](https://huggingface.co/datasets/pipecat-ai/smart-turn-data-v3.2-test)
 (CC-BY-4.0).
 

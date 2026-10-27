@@ -6,9 +6,9 @@ pub mod call_state;
 pub mod client;
 pub mod elevenlabs;
 pub mod endpoint;
-#[cfg(feature = "heap-stats")]
 pub mod heap;
 pub mod mock;
+pub mod models;
 pub mod onnx;
 pub mod openai;
 pub mod ring;
