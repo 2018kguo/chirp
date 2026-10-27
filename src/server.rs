@@ -13,6 +13,7 @@ use axum::Router;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::admission::Admission;
 use crate::brain::Brain;
 use crate::call::{self, Shared, SpeechPolicy};
 use crate::elevenlabs::ElevenLabs;
@@ -155,7 +156,12 @@ where
 {
     let shared = shared_from_env().await?;
     sip_from_env(&shared, make_brain.clone()).await?;
-    listen(router(shared, require_token_from_env(make_brain))).await
+    let admission = shared.admission.clone();
+    listen(
+        router(shared, require_token_from_env(make_brain)),
+        admission,
+    )
+    .await
 }
 
 /// Answers phone calls when `CHIRP_SIP_PORT` is set (media on
@@ -226,7 +232,7 @@ pub async fn shared_from_env() -> anyhow::Result<Shared> {
         webrtc: webrtc_from_env().await?,
         // ~62 calls per vCPU served cleanly on a c7a (PLAN.md); past the
         // limit new calls are refused before they open any paid session.
-        admission: crate::admission::Admission::new(env_or("CHIRP_MAX_CALLS", cores * 60)),
+        admission: Admission::new(env_or("CHIRP_MAX_CALLS", cores * 60)),
     })
 }
 
@@ -260,8 +266,10 @@ async fn outbound_ip() -> std::net::IpAddr {
     probe.await.unwrap_or([127, 0, 0, 1].into())
 }
 
-/// Serves `router` on `PORT` (default 7861) until SIGTERM.
-pub async fn listen(router: Router) -> anyhow::Result<()> {
+/// Serves `router` on `PORT` (default 7861) until SIGTERM, then drains:
+/// new calls are refused (on every transport) and calls in progress get up
+/// to `CHIRP_DRAIN_SECS` (default 30) to end.
+pub async fn listen(router: Router, admission: Admission) -> anyhow::Result<()> {
     #[cfg(feature = "heap-stats")]
     let router = router.route(
         "/debug/heap",
@@ -275,7 +283,7 @@ pub async fn listen(router: Router) -> anyhow::Result<()> {
     );
     let address: SocketAddr = ([0, 0, 0, 0], env_or("PORT", 7861u16)).into();
     tracing::info!(%address, "chirp listening");
-    // On SIGTERM, stop accepting calls and return, so profilers can write out.
+    // On SIGTERM, stop accepting connections, then drain.
     let terminate = async {
         if let Ok(mut signal) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -291,6 +299,12 @@ pub async fn listen(router: Router) -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(terminate)
     .await?;
+    let timeout = std::time::Duration::from_secs(env_or("CHIRP_DRAIN_SECS", 30));
+    tracing::info!(calls = admission.active(), "draining");
+    let left = admission.drain(timeout).await;
+    if left > 0 {
+        tracing::warn!(calls = left, "drain timed out; ending calls");
+    }
     Ok(())
 }
 

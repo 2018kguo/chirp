@@ -82,6 +82,7 @@ cargo run --release --bin call_client -- ws://127.0.0.1:7861/v1/calls question.w
 | `CHIRP_SIP_RTP_PORT` | 7864 | UDP port every phone call's audio shares |
 | `CHIRP_SIP_ALLOW` | any (warned) | addresses or CIDR blocks allowed to place calls: your trunk's |
 | `CHIRP_SIP_RTP_TIMEOUT_SECS` | 10 | a caller silent on RTP this long has gone; chirp hangs up |
+| `CHIRP_DRAIN_SECS` | 30 | after SIGTERM, new calls are refused and calls in progress get this long to end |
 | `CHIRP_MODELS_DIR` | `models` | missing models are downloaded here at startup |
 | `PORT` | 7861 | |
 
@@ -134,7 +135,8 @@ chirp::server::serve(|_| Some(Echo)).await
 
 To mount the call routes beside your own, build them with
 `chirp::server::router(chirp::server::shared_from_env().await?, make_brain)`
-and serve the combined axum `Router` with `chirp::server::listen`
+and serve the combined axum `Router` with
+`chirp::server::listen(router, shared.admission.clone())`
 (`serve` also wraps `make_brain` in `require_token_from_env`);
 `chirp::server::sip_from_env` adds phone calls the same way `serve` does.
 
