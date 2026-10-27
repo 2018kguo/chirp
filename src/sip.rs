@@ -266,15 +266,18 @@ const T2: Duration = Duration::from_secs(4);
 
 /// A 200 OK awaiting its ACK.
 struct Unacked {
+    /// The INVITE's CSeq number: only its ACK (same number) counts.
+    cseq: u32,
     next: tokio::time::Instant,
     interval: Duration,
     give_up: tokio::time::Instant,
 }
 
 impl Unacked {
-    fn new() -> Self {
+    fn new(invite: &Message) -> Self {
         let now = tokio::time::Instant::now();
         Self {
+            cseq: cseq_number(invite),
             next: now + T1,
             interval: T1,
             give_up: now + T1 * 64,
@@ -317,6 +320,8 @@ async fn signaling<B, F>(
     // Answers not yet ACKed (usually none), by Call-ID.
     let mut unacked: HashMap<String, Unacked> = HashMap::new();
     let mut retransmit = tokio::time::interval(T1 / 2);
+    // Ticks missed while nothing was pending aren't owed.
+    retransmit.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buffer = vec![0u8; 8192];
     loop {
         tokio::select! {
@@ -340,7 +345,7 @@ async fn signaling<B, F>(
                                 let extra = format!("{contact}Content-Type: application/sdp\r\n");
                                 dialog.answer = response(&request, "200 OK", Some(&dialog.to_tag), &extra, &dialog.sdp);
                                 dialog.branch = request.branch().to_string();
-                                unacked.insert(call_id.clone(), Unacked::new());
+                                unacked.insert(call_id.clone(), Unacked::new(&request));
                             }
                             Some(dialog.answer.clone())
                         } else if let Some((remote, law)) = offer {
@@ -399,7 +404,7 @@ async fn signaling<B, F>(
                                             drop(permit);
                                         });
                                         slot.insert(call_id.clone());
-                                        unacked.insert(call_id.clone(), Unacked::new());
+                                        unacked.insert(call_id.clone(), Unacked::new(&request));
                                         dialogs.insert(call_id, Dialog {
                                             branch: request.branch().to_string(),
                                             answer: answer.clone(),
@@ -419,7 +424,11 @@ async fn signaling<B, F>(
                         }
                     }
                     "ACK" => {
-                        unacked.remove(&call_id);
+                        // A late ACK for an earlier INVITE leaves a
+                        // re-INVITE's answer pending.
+                        if unacked.get(&call_id).is_some_and(|pending| pending.cseq == cseq_number(&request)) {
+                            unacked.remove(&call_id);
+                        }
                         None
                     }
                     "BYE" | "CANCEL" => {
@@ -456,12 +465,15 @@ async fn signaling<B, F>(
                 let now = tokio::time::Instant::now();
                 let mut gave_up = Vec::new();
                 for (call_id, pending) in unacked.iter_mut() {
-                    if now < pending.next {
+                    let Some(dialog) = dialogs.get(call_id) else {
+                        gave_up.push(call_id.clone());
                         continue;
-                    }
-                    let Some(dialog) = dialogs.get(call_id) else { continue };
+                    };
                     if now >= pending.give_up {
                         gave_up.push(call_id.clone());
+                        continue;
+                    }
+                    if now < pending.next {
                         continue;
                     }
                     let _ = socket.send_to(dialog.answer.as_bytes(), dialog.caller).await;
@@ -481,6 +493,15 @@ async fn signaling<B, F>(
             }
         }
     }
+}
+
+/// A request's CSeq number (`CSeq: 2 INVITE` -> 2).
+fn cseq_number(request: &Message) -> u32 {
+    request
+        .header("CSeq")
+        .and_then(|cseq| cseq.split_whitespace().next())
+        .and_then(|number| number.parse().ok())
+        .unwrap_or_default()
 }
 
 /// A BYE in an answered dialog: chirp is the callee, so From and To swap.
