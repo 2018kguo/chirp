@@ -91,7 +91,8 @@ Building needs cmake (libopus is compiled in).
 `GET /metrics` serves Prometheus counters: calls active, started, refused
 (by reason) and failed; turns by what ended them; and the mean time from
 the end of a turn to the reply's first audio and Smart Turn's queue wait.
-`GET /health` answers `ok`.
+`GET /health` answers `ok`. Neither needs `CHIRP_TOKEN`. A token sent as `?token=` can end up in
+proxy access logs; prefer the header where the client can set one.
 
 ## Transports
 
