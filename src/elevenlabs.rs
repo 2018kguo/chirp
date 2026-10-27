@@ -80,10 +80,17 @@ impl ElevenLabs {
             .write_buffer_size(0);
         // No Nagle: audio and transcripts are small writes that must leave now.
         let connector = Connector::Rustls(self.tls.clone());
-        let (socket, _) =
-            connect_async_tls_with_config(request, Some(config), true, Some(connector))
-                .await
-                .context("ElevenLabs connect")?;
+        // Boxed: the TLS handshake's ~10 KB of state is needed only while
+        // connecting, and would otherwise sit in every call's future (and
+        // every reply's) for its whole life.
+        let (socket, _) = Box::pin(connect_async_tls_with_config(
+            request,
+            Some(config),
+            true,
+            Some(connector),
+        ))
+        .await
+        .context("ElevenLabs connect")?;
         Ok(socket)
     }
 

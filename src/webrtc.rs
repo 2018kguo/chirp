@@ -30,6 +30,7 @@ use str0m::channel::ChannelId;
 use str0m::format::Codec;
 use str0m::media::{Frequency, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
+use str0m::rtp::Extension;
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -132,6 +133,11 @@ impl WebRtc {
             .set_ice_lite(true)
             .clear_codecs()
             .enable_opus(true, false)
+            // Only the media id: no transport-wide congestion feedback
+            // (chirp sends one fixed-rate audio stream), whose reports were
+            // most of a session's queued RTCP.
+            .clear_extension_map()
+            .set_extension(4, Extension::RtpMid)
             .build(Instant::now());
         rtc.add_local_candidate(Candidate::host(hub.public, "udp")?);
         let offer = SdpOffer::from_sdp_string(offer).context("SDP offer")?;

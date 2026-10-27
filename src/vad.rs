@@ -233,6 +233,9 @@ impl CallVad {
             input[..CONTEXT].copy_from_slice(&self.context);
             input[CONTEXT..].copy_from_slice(&self.pending[..WINDOW]);
             self.pending.drain(..WINDOW);
+            // The next window's context, taken now so `input` isn't held
+            // across the await (it would sit in every call's future).
+            self.context.copy_from_slice(&input[WINDOW..]);
             self.model
                 .requests
                 .send(Request {
@@ -255,7 +258,6 @@ impl CallVad {
                 self.reply.ready.notified().await;
             };
             let (confidence, state) = scored.context("VAD batch failed")?;
-            self.context.copy_from_slice(&input[WINDOW..]);
             self.state = state;
             self.last_confidence = confidence;
             if let Some(change) = self.observe(confidence) {
