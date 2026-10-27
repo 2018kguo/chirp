@@ -1,6 +1,10 @@
 //! The HTTP surface: `GET /health` and `GET /v1/calls` (WebSocket upgrade).
 
-use axum::extract::{State, WebSocketUpgrade};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
+use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -13,13 +17,33 @@ use crate::brain::Brain;
 use crate::call::{self, Shared, SpeechPolicy};
 use crate::elevenlabs::ElevenLabs;
 use crate::endpoint::TurnModel;
+use crate::request::{CallRequest, Transport};
 use crate::vad::VadModel;
 
-/// Serves calls, making one brain per call with `make_brain`.
+/// The call a request is for, from its headers, query and peer address.
+fn call_request(transport: Transport, parts: &Parts) -> CallRequest {
+    let query = parts
+        .uri
+        .query()
+        .and_then(|query| serde_urlencoded::from_str::<HashMap<String, String>>(query).ok())
+        .unwrap_or_default();
+    CallRequest {
+        transport,
+        remote: parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0),
+        headers: parts.headers.clone(),
+        query,
+    }
+}
+
+/// Serves calls. `make_brain` sees each call's request and returns its
+/// brain, or `None` to refuse it (403).
 pub fn router<B, F>(shared: Shared, make_brain: F) -> Router
 where
     B: Brain,
-    F: Fn() -> B + Clone + Send + Sync + 'static,
+    F: Fn(&CallRequest) -> Option<B> + Clone + Send + Sync + 'static,
 {
     let webrtc_brain = make_brain.clone();
     Router::new()
@@ -27,9 +51,12 @@ where
         .route(
             "/v1/calls",
             get(
-                move |State(shared): State<Shared>, upgrade: WebSocketUpgrade| {
-                    let brain = make_brain();
+                move |State(shared): State<Shared>, parts: Parts, upgrade: WebSocketUpgrade| {
+                    let brain = make_brain(&call_request(Transport::WebSocket, &parts));
                     async move {
+                        let Some(brain) = brain else {
+                            return (StatusCode::FORBIDDEN, "refused").into_response();
+                        };
                         // Behind already: a new call would make every call worse.
                         if shared.turn.overloaded() {
                             return (StatusCode::SERVICE_UNAVAILABLE, "at capacity")
@@ -56,39 +83,62 @@ where
         )
         .route(
             "/v1/webrtc",
-            post(move |State(shared): State<Shared>, offer: String| {
-                let brain = webrtc_brain();
-                async move {
-                    let Some(webrtc) = shared.webrtc.clone() else {
-                        return (StatusCode::NOT_FOUND, "WebRTC is off").into_response();
-                    };
-                    if shared.turn.overloaded() {
-                        return (StatusCode::SERVICE_UNAVAILABLE, "at capacity").into_response();
+            post(
+                move |State(shared): State<Shared>, parts: Parts, offer: String| {
+                    let brain = webrtc_brain(&call_request(Transport::WebRtc, &parts));
+                    async move {
+                        let Some(brain) = brain else {
+                            return (StatusCode::FORBIDDEN, "refused").into_response();
+                        };
+                        let Some(webrtc) = shared.webrtc.clone() else {
+                            return (StatusCode::NOT_FOUND, "WebRTC is off").into_response();
+                        };
+                        if shared.turn.overloaded() {
+                            return (StatusCode::SERVICE_UNAVAILABLE, "at capacity")
+                                .into_response();
+                        }
+                        let Some(permit) = shared.admission.admit() else {
+                            return (StatusCode::SERVICE_UNAVAILABLE, "at the call limit")
+                                .into_response();
+                        };
+                        match webrtc.answer(&offer, shared, brain, permit).await {
+                            Ok(answer) => (
+                                StatusCode::CREATED,
+                                [(axum::http::header::CONTENT_TYPE, "application/sdp")],
+                                answer,
+                            )
+                                .into_response(),
+                            Err(error) => {
+                                (StatusCode::BAD_REQUEST, error.to_string()).into_response()
+                            }
+                        }
                     }
-                    let Some(permit) = shared.admission.admit() else {
-                        return (StatusCode::SERVICE_UNAVAILABLE, "at the call limit")
-                            .into_response();
-                    };
-                    match webrtc.answer(&offer, shared, brain, permit).await {
-                        Ok(answer) => (
-                            StatusCode::CREATED,
-                            [(axum::http::header::CONTENT_TYPE, "application/sdp")],
-                            answer,
-                        )
-                            .into_response(),
-                        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
-                    }
-                }
-            }),
+                },
+            ),
         )
         .with_state(shared)
+}
+
+/// `make_brain`, refusing callers without `CHIRP_TOKEN` when it is set
+/// (`Authorization: Bearer <token>` or `?token=`).
+pub fn require_token_from_env<B, F>(
+    make_brain: F,
+) -> impl Fn(&CallRequest) -> Option<B> + Clone + Send + Sync + 'static
+where
+    F: Fn(&CallRequest) -> Option<B> + Clone + Send + Sync + 'static,
+{
+    let token: Option<Arc<str>> = std::env::var("CHIRP_TOKEN").ok().map(Into::into);
+    move |request: &CallRequest| match &token {
+        Some(token) if !request.has_token(token) => None,
+        _ => make_brain(request),
+    }
 }
 
 /// A listener whose connections send small writes at once (no Nagle): a
 /// call's audio leaves in 640-byte frames every 20 ms.
 pub fn nodelay(
     listener: tokio::net::TcpListener,
-) -> impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = std::net::SocketAddr> {
+) -> axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)> {
     use axum::serve::ListenerExt;
     listener.tap_io(|connection| {
         let _ = connection.set_nodelay(true);
@@ -101,11 +151,11 @@ pub fn nodelay(
 pub async fn serve<B, F>(make_brain: F) -> anyhow::Result<()>
 where
     B: Brain,
-    F: Fn() -> B + Clone + Send + Sync + 'static,
+    F: Fn(&CallRequest) -> Option<B> + Clone + Send + Sync + 'static,
 {
     let shared = shared_from_env().await?;
     sip_from_env(&shared, make_brain.clone()).await?;
-    listen(router(shared, make_brain)).await
+    listen(router(shared, require_token_from_env(make_brain))).await
 }
 
 /// Answers phone calls when `CHIRP_SIP_PORT` is set (media on
@@ -113,7 +163,7 @@ where
 pub async fn sip_from_env<B, F>(shared: &Shared, make_brain: F) -> anyhow::Result<()>
 where
     B: Brain,
-    F: Fn() -> B + Send + Sync + 'static,
+    F: Fn(&CallRequest) -> Option<B> + Send + Sync + 'static,
 {
     let Ok(port) = std::env::var("CHIRP_SIP_PORT") else {
         return Ok(());
@@ -234,9 +284,13 @@ pub async fn listen(router: Router) -> anyhow::Result<()> {
         }
     };
     let listener = nodelay(tokio::net::TcpListener::bind(address).await?);
-    axum::serve(listener, router)
-        .with_graceful_shutdown(terminate)
-        .await?;
+    // Peer addresses reach the router (`CallRequest::remote`).
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(terminate)
+    .await?;
     Ok(())
 }
 

@@ -71,6 +71,7 @@ cargo run --release --bin call_client -- ws://127.0.0.1:7861/v1/calls question.w
 | `CHIRP_BRAIN_URL` | OpenAI | any OpenAI-compatible `/chat/completions` API |
 | `CHIRP_BRAIN_KEY`, `CHIRP_BRAIN_MODEL` | required | |
 | `CHIRP_SYSTEM_PROMPT` | none | |
+| `CHIRP_TOKEN` | none (open) | WebSocket and WebRTC callers must send it (`Authorization: Bearer`, or `?token=` from a browser); others get 403 |
 | `CHIRP_VAD_THREADS` | cores / 4, at least 2 | |
 | `CHIRP_TURN_THREADS` | cores − 2 | |
 | `CHIRP_MAX_CALLS` | 60 per core | calls at once, across transports; past it new calls get 503 |
@@ -108,7 +109,10 @@ Building needs cmake (libopus is compiled in).
 
 To answer with something other than a chat-completions API, implement
 `Brain` and hand `chirp::server::serve` a function that makes one per call.
-It reads the same environment variables:
+It sees the call's `CallRequest` (transport, caller address, headers, query;
+for SIP, the INVITE's `from`, `to` and `call_id`) and returns `None` to
+refuse it (403), so one server can give each caller their own brain. It
+reads the same environment variables:
 
 ```rust
 use chirp::brain::{Brain, Reply, ReplyEvent, Utterance};
@@ -124,13 +128,14 @@ impl Brain for Echo {
 }
 
 # async fn run() -> anyhow::Result<()> {
-chirp::server::serve(|| Echo).await
+chirp::server::serve(|_| Some(Echo)).await
 # }
 ```
 
 To mount the call routes beside your own, build them with
 `chirp::server::router(chirp::server::shared_from_env().await?, make_brain)`
-and serve the combined axum `Router` with `chirp::server::listen`;
+and serve the combined axum `Router` with `chirp::server::listen`
+(`serve` also wraps `make_brain` in `require_token_from_env`);
 `chirp::server::sip_from_env` adds phone calls the same way `serve` does.
 
 `ReplyEvent::Progress` speaks a short status line (for example while a tool

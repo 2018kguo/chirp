@@ -8,6 +8,7 @@
 //! A SIP trunk (or a softphone) sends INVITEs to `CHIRP_SIP_PORT`; media
 //! flows to `CHIRP_RTP_PORT` at `CHIRP_PUBLIC_ADDR`'s address.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -20,6 +21,7 @@ use tokio::sync::mpsc;
 use crate::brain::Brain;
 use crate::call::{self, Shared, ToCaller};
 use crate::playout::{Encoder, Playout, FRAME};
+use crate::request::{CallRequest, Transport};
 
 /// Where the SIP and RTP sockets ended up.
 pub struct SipAddrs {
@@ -80,7 +82,7 @@ fn allowed(ip: IpAddr, list: &[(IpAddr, u8)]) -> bool {
 pub async fn start<B, F>(config: SipConfig, shared: Shared, make_brain: F) -> Result<SipAddrs>
 where
     B: Brain,
-    F: Fn() -> B + Send + Sync + 'static,
+    F: Fn(&CallRequest) -> Option<B> + Send + Sync + 'static,
 {
     let sip = UdpSocket::bind(config.sip_bind)
         .await
@@ -277,7 +279,7 @@ async fn signaling<B, F>(
     make_brain: F,
 ) where
     B: Brain,
-    F: Fn() -> B + Send + Sync + 'static,
+    F: Fn(&CallRequest) -> Option<B> + Send + Sync + 'static,
 {
     let local = socket.local_addr().ok();
     let contact = format!(
@@ -286,6 +288,8 @@ async fn signaling<B, F>(
         local.map_or(5060, |l| l.port())
     );
     let mut dialogs: HashMap<String, Dialog> = HashMap::new();
+    // Each call's media address, to its Call-ID.
+    let mut by_media: HashMap<SocketAddr, String> = HashMap::new();
     let mut buffer = vec![0u8; 8192];
     loop {
         tokio::select! {
@@ -311,45 +315,69 @@ async fn signaling<B, F>(
                                 dialog.branch = request.branch().to_string();
                             }
                             Some(dialog.answer.clone())
-                        } else if offer.is_some_and(|(remote, _)| dialogs.values().any(|d| d.remote_media == remote)) {
-                            // That media address is another call's.
-                            Some(response(&request, "486 Busy Here", None, "", ""))
-                        } else if shared.turn.overloaded() {
-                            Some(response(&request, "503 Service Unavailable", None, "", ""))
-                        } else if let (Some((remote, law)), Some(permit)) = (offer, offer.and_then(|_| shared.admission.admit())) {
-                            let to_tag = format!("{:x}", rand_tag());
-                            let sdp = answer_sdp(media, law);
-                            let extra = format!("{contact}Content-Type: application/sdp\r\n");
-                            let answer = response(&request, "200 OK", Some(&to_tag), &extra, &sdp);
-                            let _ = socket
-                                .send_to(response(&request, "100 Trying", None, "", "").as_bytes(), from)
-                                .await;
-                            let (audio_in, audio) = mpsc::channel::<Bytes>(64);
-                            let (to_caller, from_call) = mpsc::channel::<ToCaller>(512);
-                            let _ = to_media
-                                .send(ToMedia::Add { remote, law, audio_in, from_call })
-                                .await;
-                            let audio = futures::stream::unfold(audio, |mut audio| async move {
-                                audio.recv().await.map(|pcm| (pcm, audio))
-                            });
-                            let (shared, brain) = (shared.clone(), make_brain());
-                            tokio::spawn(async move {
-                                call::run(Box::pin(audio), to_caller, shared, brain).await;
-                                drop(permit);
-                            });
-                            dialogs.insert(call_id, Dialog {
-                                branch: request.branch().to_string(),
-                                answer: answer.clone(),
-                                sdp,
-                                caller: from,
-                                remote_media: remote,
-                                to_tag,
-                                invite: request,
-                                cseq: 1,
-                            });
-                            Some(answer)
-                        } else if offer.is_some() {
-                            Some(response(&request, "503 Service Unavailable", None, "", ""))
+                        } else if let Some((remote, law)) = offer {
+                            let slot = match by_media.entry(remote) {
+                                Entry::Vacant(slot) => slot,
+                                // That media address is another call's.
+                                Entry::Occupied(_) => {
+                                    let busy = response(&request, "486 Busy Here", None, "", "");
+                                    let _ = socket.send_to(busy.as_bytes(), from).await;
+                                    continue;
+                                }
+                            };
+                            if shared.turn.overloaded() {
+                                Some(response(&request, "503 Service Unavailable", None, "", ""))
+                            } else {
+                                let caller = CallRequest {
+                                    transport: Transport::Sip,
+                                    remote: Some(from),
+                                    headers: Default::default(),
+                                    query: [("from", "From"), ("to", "To"), ("call_id", "Call-ID")]
+                                        .into_iter()
+                                        .filter_map(|(key, header)| {
+                                            Some((key.to_string(), request.header(header)?.to_string()))
+                                        })
+                                        .collect(),
+                                };
+                                match (make_brain(&caller), shared.admission.admit()) {
+                                    (None, _) => Some(response(&request, "403 Forbidden", None, "", "")),
+                                    (Some(_), None) => Some(response(&request, "503 Service Unavailable", None, "", "")),
+                                    (Some(brain), Some(permit)) => {
+                                        let to_tag = format!("{:x}", rand_tag());
+                                        let sdp = answer_sdp(media, law);
+                                        let extra = format!("{contact}Content-Type: application/sdp\r\n");
+                                        let answer = response(&request, "200 OK", Some(&to_tag), &extra, &sdp);
+                                        let _ = socket
+                                            .send_to(response(&request, "100 Trying", None, "", "").as_bytes(), from)
+                                            .await;
+                                        let (audio_in, audio) = mpsc::channel::<Bytes>(64);
+                                        let (to_caller, from_call) = mpsc::channel::<ToCaller>(512);
+                                        let _ = to_media
+                                            .send(ToMedia::Add { remote, law, audio_in, from_call })
+                                            .await;
+                                        let audio = futures::stream::unfold(audio, |mut audio| async move {
+                                            audio.recv().await.map(|pcm| (pcm, audio))
+                                        });
+                                        let shared = shared.clone();
+                                        tokio::spawn(async move {
+                                            call::run(Box::pin(audio), to_caller, shared, brain).await;
+                                            drop(permit);
+                                        });
+                                        slot.insert(call_id.clone());
+                                        dialogs.insert(call_id, Dialog {
+                                            branch: request.branch().to_string(),
+                                            answer: answer.clone(),
+                                            sdp,
+                                            caller: from,
+                                            remote_media: remote,
+                                            to_tag,
+                                            invite: request,
+                                            cseq: 1,
+                                        });
+                                        Some(answer)
+                                    }
+                                }
+                            }
                         } else {
                             Some(response(&request, "488 Not Acceptable Here", None, "", ""))
                         }
@@ -357,6 +385,7 @@ async fn signaling<B, F>(
                     "ACK" => None,
                     "BYE" | "CANCEL" => {
                         if let Some(dialog) = dialogs.remove(&call_id) {
+                            by_media.remove(&dialog.remote_media);
                             let _ = to_media.send(ToMedia::Remove(dialog.remote_media)).await;
                         }
                         Some(response(&request, "200 OK", None, "", ""))
@@ -370,13 +399,7 @@ async fn signaling<B, F>(
             }
             Some(remote) = ended.recv() => {
                 // The call ended on chirp's side: hang up on the caller.
-                let Some(call_id) = dialogs
-                    .iter()
-                    .find(|(_, dialog)| dialog.remote_media == remote)
-                    .map(|(call_id, _)| call_id.clone())
-                else {
-                    continue;
-                };
+                let Some(call_id) = by_media.remove(&remote) else { continue };
                 if let Some(mut dialog) = dialogs.remove(&call_id) {
                     dialog.cseq += 1;
                     let bye = bye(&dialog, &call_id, &contact);

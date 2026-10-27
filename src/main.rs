@@ -47,8 +47,14 @@ async fn main() -> Result<()> {
     let key = std::env::var("CHIRP_BRAIN_KEY").context("CHIRP_BRAIN_KEY")?;
     let model = std::env::var("CHIRP_BRAIN_MODEL").context("CHIRP_BRAIN_MODEL")?;
     let system_prompt = std::env::var("CHIRP_SYSTEM_PROMPT").ok();
-    chirp::server::serve(move || {
-        OpenAiBrain::new(http.clone(), &url, &key, &model, system_prompt.as_deref())
+    chirp::server::serve(move |_| {
+        Some(OpenAiBrain::new(
+            http.clone(),
+            &url,
+            &key,
+            &model,
+            system_prompt.as_deref(),
+        ))
     })
     .await
 }
