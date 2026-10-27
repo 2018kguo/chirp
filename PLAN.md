@@ -225,3 +225,10 @@ numbers that matter, not a port.
   fails when inbound audio is silenced. Not yet: digest auth, TCP/TLS,
   200 OK retransmission timers, NAT latching, DTMF, hold. No carrier account
   yet, so no real phone call has been placed.
+- **WebRTC: browsers send no audio while the caller is silent (Opus DTX).**
+  Found by driving a browser page in headless Chrome: the call received
+  6.2 s of audio over 12 s, the VAD never saw the quiet windows that end a
+  turn, and no turn ever ended. The str0m test peer had sent silent frames,
+  so it missed this; it now skips silent frames like a browser, and both
+  WebRTC tests failed until the hub filled caller gaps over 60 ms with
+  silence in real time.

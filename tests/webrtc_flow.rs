@@ -134,7 +134,10 @@ async fn call(url: &str, audio: Vec<i16>, seconds: u64) -> Heard {
                     Some(frame) => frame.iter().copied().chain(std::iter::repeat(0)).take(320).collect(),
                     None => vec![0; 320],
                 };
-                if let Some(writer) = rtc.writer(mid) {
+                // Like a browser's Opus with DTX: silence is (almost) not
+                // sent at all, so the server must not wait for it.
+                let silent = frame.iter().all(|sample| *sample == 0);
+                if let Some(writer) = rtc.writer(mid).filter(|_| !silent) {
                     let pt = writer.payload_params().find(|p| p.spec().codec == Codec::Opus).map(|p| p.pt());
                     if let Some(pt) = pt {
                         let length = encoder.encode(&frame, &mut packet).unwrap();

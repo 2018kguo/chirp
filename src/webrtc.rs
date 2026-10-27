@@ -31,6 +31,8 @@ use crate::playout::{Playout, FRAME};
 
 /// 20 ms on Opus's RTP clock, which is always 48 kHz.
 const FRAME_RTP_TICKS: u64 = 960;
+/// No caller audio for this long (beyond network jitter) is silence.
+const SILENCE_AFTER: Duration = Duration::from_millis(60);
 
 /// The shared socket's hub; cloning shares it.
 #[derive(Clone)]
@@ -87,6 +89,8 @@ impl WebRtc {
             channel: None,
             events: VecDeque::new(),
             rtp_time: 0,
+            last_media: None,
+            filled_until: Instant::now(),
         };
         self.peers
             .send(peer)
@@ -115,6 +119,10 @@ struct Peer {
     /// Events not yet sent (the data channel may not be open yet).
     events: VecDeque<String>,
     rtp_time: u64,
+    /// When the caller's audio last arrived, and up to when the gap since has
+    /// been filled with silence.
+    last_media: Option<Instant>,
+    filled_until: Instant,
 }
 
 impl Peer {
@@ -151,19 +159,40 @@ impl Peer {
                     .iter()
                     .flat_map(|sample| sample.to_le_bytes())
                     .collect();
-                if let Some(audio_in) = &self.audio_in {
-                    // A call that can't keep up loses audio rather than
-                    // stalling every other call on the hub.
-                    let _ = audio_in.try_send(Bytes::from(pcm));
-                }
+                self.hear(pcm);
+                self.last_media = Some(Instant::now());
             }
             Event::ChannelOpen(id, _) => self.channel = Some(id),
             _ => {}
         }
     }
 
+    fn hear(&mut self, pcm: Vec<u8>) {
+        if let Some(audio_in) = &self.audio_in {
+            // A call that can't keep up loses audio rather than stalling
+            // every other call on the hub.
+            let _ = audio_in.try_send(Bytes::from(pcm));
+        }
+    }
+
+    /// Browsers send (almost) nothing while the caller is silent (Opus DTX).
+    /// The call still needs that silence, in real time: a turn ends only
+    /// after enough quiet audio.
+    fn fill_silence(&mut self, now: Instant) {
+        let Some(last) = self.last_media else { return };
+        let from = last.max(self.filled_until);
+        let gap = now.saturating_duration_since(from);
+        if gap < SILENCE_AFTER {
+            return;
+        }
+        let frames = (gap.as_millis() / 20) as u32;
+        self.hear(vec![0; FRAME * 2 * frames as usize]);
+        self.filled_until = from + Duration::from_millis(20) * frames;
+    }
+
     /// Every 20 ms: take what the call sent, send events, play one frame.
     fn pace(&mut self, now: Instant) {
+        self.fill_silence(now);
         let events = &mut self.events;
         self.playout
             .take(|event| events.push_back(event.to_string()));
