@@ -64,7 +64,9 @@ struct HubHandle {
 
 struct NewSession {
     id: u64,
-    rtc: Rtc,
+    /// Boxed (str0m's `Rtc` is ~10 KB): channel slots and map buckets
+    /// stay small, and a session moves without copying it.
+    rtc: Box<Rtc>,
     ufrag: String,
     to_media: mpsc::Sender<Bytes>,
 }
@@ -129,16 +131,18 @@ impl WebRtc {
         permit: CallPermit,
     ) -> Result<String> {
         let hub = &self.hubs[self.next_hub.fetch_add(1, Ordering::Relaxed) % self.hubs.len()];
-        let mut rtc = RtcConfig::new()
-            .set_ice_lite(true)
-            .clear_codecs()
-            .enable_opus(true, false)
-            // Only the media id: no transport-wide congestion feedback
-            // (chirp sends one fixed-rate audio stream), whose reports were
-            // most of a session's queued RTCP.
-            .clear_extension_map()
-            .set_extension(4, Extension::RtpMid)
-            .build(Instant::now());
+        let mut rtc = Box::new(
+            RtcConfig::new()
+                .set_ice_lite(true)
+                .clear_codecs()
+                .enable_opus(true, false)
+                // Only the media id: no transport-wide congestion feedback
+                // (chirp sends one fixed-rate audio stream), whose reports were
+                // most of a session's queued RTCP.
+                .clear_extension_map()
+                .set_extension(4, Extension::RtpMid)
+                .build(Instant::now()),
+        );
         rtc.add_local_candidate(Candidate::host(hub.public, "udp")?);
         let offer = SdpOffer::from_sdp_string(offer).context("SDP offer")?;
         let answer = rtc.sdp_api().accept_offer(offer)?.to_sdp_string();
@@ -260,7 +264,7 @@ fn media(
 // --- hubs ---------------------------------------------------------------------
 
 struct Session {
-    rtc: Rtc,
+    rtc: Box<Rtc>,
     ufrag: String,
     to_media: mpsc::Sender<Bytes>,
     mid: Option<Mid>,
