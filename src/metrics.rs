@@ -23,10 +23,20 @@ impl Counter {
     }
 }
 
-/// A `_sum` (in microseconds) and `_count` pair: a mean over any window.
+/// Bucket bounds in seconds, for every timing: Smart Turn's queue wait is
+/// milliseconds, a reply's first audio up to seconds.
+const BOUNDS: [f64; 11] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// A Prometheus histogram: percentiles over any window
+/// (`histogram_quantile`), plus `_sum` and `_count`.
 pub struct Timing {
     micros: AtomicU64,
     count: AtomicU64,
+    /// Per bucket, not cumulative (summed when rendered); past the last
+    /// bound counts only in `count`.
+    buckets: [AtomicU64; BOUNDS.len()],
 }
 
 impl Timing {
@@ -34,12 +44,17 @@ impl Timing {
         Self {
             micros: AtomicU64::new(0),
             count: AtomicU64::new(0),
+            buckets: [const { AtomicU64::new(0) }; BOUNDS.len()],
         }
     }
 
     pub fn record(&self, duration: Duration) {
         self.micros.fetch_add(duration.as_micros() as u64, Relaxed);
         self.count.fetch_add(1, Relaxed);
+        let seconds = duration.as_secs_f64();
+        if let Some(bucket) = BOUNDS.iter().position(|bound| seconds <= *bound) {
+            self.buckets[bucket].fetch_add(1, Relaxed);
+        }
     }
 }
 
@@ -117,7 +132,16 @@ pub fn render(active: usize) -> String {
         let count = timing.count.load(Relaxed);
         let _ = writeln!(
             out,
-            "# HELP chirp_{name} {help}\n# TYPE chirp_{name} summary\nchirp_{name}_sum {seconds}\nchirp_{name}_count {count}"
+            "# HELP chirp_{name} {help}\n# TYPE chirp_{name} histogram"
+        );
+        let mut cumulative = 0;
+        for (bound, bucket) in BOUNDS.iter().zip(&timing.buckets) {
+            cumulative += bucket.load(Relaxed);
+            let _ = writeln!(out, "chirp_{name}_bucket{{le=\"{bound}\"}} {cumulative}");
+        }
+        let _ = writeln!(
+            out,
+            "chirp_{name}_bucket{{le=\"+Inf\"}} {count}\nchirp_{name}_sum {seconds}\nchirp_{name}_count {count}"
         );
     }
     out
@@ -136,5 +160,10 @@ mod tests {
         assert!(text.contains("chirp_turns_total{by=\"fallback\"} 1"));
         assert!(text.contains("chirp_first_audio_seconds_sum 0.25"));
         assert!(text.contains("chirp_first_audio_seconds_count 1"));
+        // Cumulative buckets: 0.25 s is under 0.25, not under 0.1.
+        assert!(text.contains("chirp_first_audio_seconds_bucket{le=\"0.1\"} 0"));
+        assert!(text.contains("chirp_first_audio_seconds_bucket{le=\"0.25\"} 1"));
+        assert!(text.contains("chirp_first_audio_seconds_bucket{le=\"10\"} 1"));
+        assert!(text.contains("chirp_first_audio_seconds_bucket{le=\"+Inf\"} 1"));
     }
 }
