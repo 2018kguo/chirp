@@ -74,7 +74,8 @@ cargo run --release --bin call_client -- ws://127.0.0.1:7861/v1/calls question.w
 | `CHIRP_VAD_THREADS` | cores / 4, at least 2 | |
 | `CHIRP_TURN_THREADS` | cores − 2 | |
 | `CHIRP_MAX_CALLS` | 60 per core | calls at once, across transports; past it new calls get 503 |
-| `CHIRP_RTC_PORT` | 7862 | UDP port every WebRTC call shares; `off` disables WebRTC |
+| `CHIRP_RTC_PORT` | 7862 | first UDP port for WebRTC (one per hub); `off` disables WebRTC |
+| `CHIRP_RTC_SHARDS` | cores / 4 | WebRTC hubs, on consecutive ports from `CHIRP_RTC_PORT` |
 | `CHIRP_PUBLIC_ADDR` | this host's outbound address, that port | where callers send WebRTC media |
 | `CHIRP_SIP_PORT` | off | UDP port to answer SIP calls on (e.g. 5060) |
 | `CHIRP_SIP_RTP_PORT` | 7864 | UDP port every phone call's audio shares |
@@ -93,8 +94,8 @@ Building needs cmake (libopus is compiled in).
 - **WebRTC**, `POST /v1/webrtc` with the browser's SDP offer as the body
   (`201` with the answer, as WHIP). Offer one audio track and a data channel;
   events arrive on it. chirp is ICE-lite with one host candidate, and paces
-  and flushes reply audio itself. One UDP socket and one task serve every
-  WebRTC call.
+  and flushes reply audio itself. A few hubs (one UDP socket each) carry
+  every WebRTC call; each call's Opus work runs in its own task.
 - **SIP** (phone calls), when `CHIRP_SIP_PORT` is set: a SIP trunk or
   softphone sends an INVITE with G.711 (PCMU or PCMA) offered; chirp answers
   and every call's RTP shares one socket. Re-INVITEs (session refreshes) are

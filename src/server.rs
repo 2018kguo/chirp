@@ -191,8 +191,12 @@ async fn webrtc_from_env() -> anyhow::Result<Option<crate::webrtc::WebRtc>> {
         Ok(address) => address.parse()?,
         Err(_) => SocketAddr::new(outbound_ip().await, port),
     };
+    // Hubs do socket I/O and session state only (codecs run per call), so a
+    // few cover many calls.
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let shards = env_or("CHIRP_RTC_SHARDS", (cores / 4).max(1));
     Ok(Some(
-        crate::webrtc::WebRtc::start(([0, 0, 0, 0], port).into(), Some(public)).await?,
+        crate::webrtc::WebRtc::start(([0, 0, 0, 0], port).into(), Some(public), shards).await?,
     ))
 }
 

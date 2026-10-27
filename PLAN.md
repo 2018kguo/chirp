@@ -243,3 +243,27 @@ numbers that matter, not a port.
   (now real time). The WebRTC hub polled every peer on every packet
   (O(N^2) per second at N calls): packets now route by source address and
   only due peers get timeouts. Each has a test that fails without its fix.
+- **Transport scaling audit and restructure (Oct 27 2026).** An independent
+  big-O review flagged the WebRTC hub as a single-task ceiling: Opus for
+  every call, and per-wakeup scans over every peer. Now each call's media
+  task does its codec work and pacing; hubs (`CHIRP_RTC_SHARDS`, one UDP
+  socket each) do socket I/O and str0m only, route packets by source address
+  (a new address only via a STUN check naming a session's ICE ufrag; other
+  stray packets cost one hash lookup), and drive only touched or due
+  sessions (a deadline heap). `Playout` encodes reply audio as it arrives
+  and queues encoded frames (WebRTC ~16x less memory than PCM). SIP media:
+  allocation-free inbound path, a polyphase half-band downsampler, O(1)
+  dialog lookups, hang-ups that can't be dropped. The call loop reuses one
+  commit-deadline timer. c7a.4xlarge, 30 s, CPU ms per call-second and turn
+  p99 (bench_load chirp-webrtc / chirp-sip, callers on the same box):
+
+  | | before | after |
+  |---|---|---|
+  | WebRTC 300 | 13.6 ms, p99 808 | 13.8 ms, p99 810 |
+  | WebRTC 600 | 102 refused, p99 2,859 | 0 refused, p99 830 |
+  | SIP 1,000 | 10.1 ms, p99 1,839 | 10.4 ms, p99 1,006 |
+  | WebSocket 1,000 | 12.2 ms, p99 803 | 12.2 ms, p99 805 |
+
+  WebRTC at 1,000 calls refused 410 with the box at load 16.6 of 16 vCPUs:
+  half of it was the benchmark's own callers encoding Opus, so that run
+  measures the harness, not chirp.

@@ -13,13 +13,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::brain::Brain;
 use crate::call::{self, Shared, ToCaller};
-use crate::playout::{Playout, FRAME};
+use crate::playout::{Encoder, Playout, FRAME};
 
 /// Where the SIP and RTP sockets ended up.
 pub struct SipAddrs {
@@ -94,7 +94,7 @@ where
     };
     let media = SocketAddr::new(config.public_ip.unwrap_or(addrs.rtp.ip()), addrs.rtp.port());
     let (to_media, from_signaling) = mpsc::channel(64);
-    let (ended_tx, ended) = mpsc::channel(1024);
+    let (ended_tx, ended) = mpsc::unbounded_channel();
     tokio::spawn(media_hub(rtp, from_signaling, ended_tx, config.rtp_timeout));
     tokio::spawn(signaling(
         sip,
@@ -262,7 +262,7 @@ enum ToMedia {
         remote: SocketAddr,
         law: Law,
         audio_in: mpsc::Sender<Bytes>,
-        playout: Playout,
+        from_call: mpsc::Receiver<ToCaller>,
     },
     Remove(SocketAddr),
 }
@@ -272,7 +272,7 @@ async fn signaling<B, F>(
     media: SocketAddr,
     allow: Option<Vec<(IpAddr, u8)>>,
     to_media: mpsc::Sender<ToMedia>,
-    mut ended: mpsc::Receiver<SocketAddr>,
+    mut ended: mpsc::UnboundedReceiver<SocketAddr>,
     shared: Shared,
     make_brain: F,
 ) where
@@ -327,7 +327,7 @@ async fn signaling<B, F>(
                             let (audio_in, audio) = mpsc::channel::<Bytes>(64);
                             let (to_caller, from_call) = mpsc::channel::<ToCaller>(512);
                             let _ = to_media
-                                .send(ToMedia::Add { remote, law, audio_in, playout: Playout::new(from_call) })
+                                .send(ToMedia::Add { remote, law, audio_in, from_call })
                                 .await;
                             let audio = futures::stream::unfold(audio, |mut audio| async move {
                                 audio.recv().await.map(|pcm| (pcm, audio))
@@ -425,9 +425,8 @@ fn rand_tag() -> u64 {
 struct RtpCall {
     law: Law,
     audio_in: mpsc::Sender<Bytes>,
-    playout: Playout,
+    playout: Playout<Encoder>,
     up: Upsampler,
-    down: Downsampler,
     seq: u16,
     timestamp: u32,
     ssrc: u32,
@@ -440,24 +439,32 @@ struct RtpCall {
 async fn media_hub(
     socket: UdpSocket,
     mut from_signaling: mpsc::Receiver<ToMedia>,
-    ended: mpsc::Sender<SocketAddr>,
+    ended: mpsc::UnboundedSender<SocketAddr>,
     rtp_timeout: Duration,
 ) {
     let mut calls: HashMap<SocketAddr, RtpCall> = HashMap::new();
     let mut buffer = vec![0u8; 2048];
     let mut packet = Vec::with_capacity(12 + FRAME / 2);
+    // The caller's audio, written here and split off per packet: no
+    // allocation per packet once warm.
+    let mut inbound = BytesMut::new();
     let mut pace = tokio::time::interval(Duration::from_millis(20));
-    pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     loop {
         tokio::select! {
             command = from_signaling.recv() => match command {
-                Some(ToMedia::Add { remote, law, audio_in, playout }) => {
+                Some(ToMedia::Add { remote, law, audio_in, from_call }) => {
+                    let mut down = Downsampler::default();
+                    let encode: Encoder = Box::new(move |frame: &[i16; FRAME]| {
+                        let mut narrow = [0i16; FRAME / 2];
+                        down.process(frame, &mut narrow);
+                        Some(narrow.iter().map(|sample| encode(law, *sample)).collect::<Vec<u8>>().into())
+                    });
                     calls.insert(remote, RtpCall {
                         law,
                         audio_in,
-                        playout,
+                        playout: Playout::new(from_call, encode),
                         up: Upsampler::default(),
-                        down: Downsampler::default(),
                         seq: 0,
                         timestamp: 0,
                         ssrc: rand_tag() as u32,
@@ -474,18 +481,20 @@ async fn media_hub(
                 let Some(call) = calls.get_mut(&source) else { continue };
                 let Some(payload) = rtp_payload(&buffer[..length]) else { continue };
                 call.last_rtp = tokio::time::Instant::now();
-                let narrow: Vec<i16> = payload.iter().map(|byte| decode(call.law, *byte)).collect();
-                let wide = call.up.process(&narrow);
-                let pcm: Vec<u8> = wide.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+                inbound.reserve(payload.len() * 4);
+                for byte in payload {
+                    let [a, b] = call.up.process(decode(call.law, *byte));
+                    inbound.extend_from_slice(&a.to_le_bytes());
+                    inbound.extend_from_slice(&b.to_le_bytes());
+                }
                 // A call that can't keep up loses audio rather than stalling the others.
-                let _ = call.audio_in.try_send(Bytes::from(pcm));
+                let _ = call.audio_in.try_send(inbound.split().freeze());
             }
             _ = pace.tick() => {
                 let mut finished = Vec::new();
                 for (remote, call) in calls.iter_mut() {
                     call.playout.take(|_| {});
                     if let Some(frame) = call.playout.frame() {
-                        let narrow = call.down.process(&frame);
                         packet.clear();
                         packet.push(0x80);
                         // Marker bit on the first packet of a talkspurt.
@@ -493,7 +502,7 @@ async fn media_hub(
                         packet.extend_from_slice(&call.seq.to_be_bytes());
                         packet.extend_from_slice(&call.timestamp.to_be_bytes());
                         packet.extend_from_slice(&call.ssrc.to_be_bytes());
-                        packet.extend(narrow.iter().map(|sample| encode(call.law, *sample)));
+                        packet.extend_from_slice(&frame);
                         call.started = true;
                         call.seq = call.seq.wrapping_add(1);
                         let _ = socket.try_send_to(&packet, *remote);
@@ -509,7 +518,7 @@ async fn media_hub(
                 }
                 for remote in finished {
                     calls.remove(&remote);
-                    let _ = ended.try_send(remote);
+                    let _ = ended.send(remote);
                 }
             }
         }
@@ -599,21 +608,21 @@ struct Upsampler {
 }
 
 impl Upsampler {
-    fn process(&mut self, narrow: &[i16]) -> Vec<i16> {
-        let mut wide = Vec::with_capacity(narrow.len() * 2);
-        for &sample in narrow {
-            wide.push(((self.last as i32 + sample as i32) / 2) as i16);
-            wide.push(sample);
-            self.last = sample;
-        }
-        wide
+    /// The two 16 kHz samples for one 8 kHz sample.
+    fn process(&mut self, sample: i16) -> [i16; 2] {
+        let between = ((self.last as i32 + sample as i32) / 2) as i16;
+        self.last = sample;
+        [between, sample]
     }
 }
 
 /// 16 -> 8 kHz: a half-band low-pass (so speech above 4 kHz doesn't fold
-/// back as noise), then every other sample.
+/// back as noise), computed only for the samples kept, from the taps that
+/// aren't zero.
+#[derive(Default)]
 struct Downsampler {
-    history: [f32; TAPS.len()],
+    /// The last input samples, for the filter's reach into the past.
+    history: [f32; TAPS.len() - 1],
 }
 
 /// Half-band low-pass (Hamming-windowed sinc, 11 taps), cutoff 4 kHz at 16 kHz.
@@ -621,33 +630,27 @@ const TAPS: [f32; 11] = [
     0.0051, 0.0000, -0.0422, 0.0000, 0.2903, 0.5000, 0.2903, 0.0000, -0.0422, 0.0000, 0.0051,
 ];
 
-impl Default for Downsampler {
-    fn default() -> Self {
-        Self {
-            history: [0.0; TAPS.len()],
-        }
-    }
-}
-
 impl Downsampler {
-    fn process(&mut self, wide: &[i16]) -> Vec<i16> {
+    fn process(&mut self, wide: &[i16; FRAME], narrow: &mut [i16; FRAME / 2]) {
+        const REACH: usize = TAPS.len() - 1;
         let gain: f32 = TAPS.iter().sum();
-        let mut narrow = Vec::with_capacity(wide.len() / 2);
-        for (index, &sample) in wide.iter().enumerate() {
-            self.history.rotate_left(1);
-            self.history[TAPS.len() - 1] = sample as f32;
-            if index % 2 == 1 {
-                let filtered: f32 = self
-                    .history
-                    .iter()
-                    .zip(TAPS)
-                    .map(|(x, t)| x * t)
-                    .sum::<f32>()
-                    / gain;
-                narrow.push(filtered.clamp(-32768.0, 32767.0) as i16);
-            }
+        let mut window = [0f32; REACH + FRAME];
+        window[..REACH].copy_from_slice(&self.history);
+        for (slot, &sample) in window[REACH..].iter_mut().zip(wide) {
+            *slot = sample as f32;
         }
-        narrow
+        for (out, odd) in narrow.iter_mut().zip((1..FRAME).step_by(2)) {
+            let reach = &window[odd..odd + TAPS.len()];
+            let filtered = TAPS
+                .iter()
+                .zip(reach)
+                .filter(|(tap, _)| **tap != 0.0)
+                .map(|(tap, x)| tap * x)
+                .sum::<f32>()
+                / gain;
+            *out = filtered.clamp(-32768.0, 32767.0) as i16;
+        }
+        self.history.copy_from_slice(&window[FRAME..]);
     }
 }
 
@@ -696,8 +699,18 @@ mod tests {
             (x.iter().skip(20).map(|&s| (s as f32).powi(2)).sum::<f32>() / (x.len() - 20) as f32)
                 .sqrt()
         };
-        let speech = Downsampler::default().process(&tone(1000.0));
-        let alias = Downsampler::default().process(&tone(6000.0));
+        let down = |wide: Vec<i16>| -> Vec<i16> {
+            let mut downsampler = Downsampler::default();
+            wide.chunks_exact(FRAME)
+                .flat_map(|frame| {
+                    let mut narrow = [0i16; FRAME / 2];
+                    downsampler.process(frame.try_into().unwrap(), &mut narrow);
+                    narrow
+                })
+                .collect()
+        };
+        let speech = down(tone(1000.0));
+        let alias = down(tone(6000.0));
         assert!(rms(&speech) > 5000.0, "1 kHz lost: rms {}", rms(&speech));
         assert!(
             rms(&alias) < 1500.0,

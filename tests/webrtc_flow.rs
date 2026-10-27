@@ -32,7 +32,7 @@ async fn chirp_webrtc_limited(script: Script, max_calls: usize) -> String {
         turn_policy: Policy::default(),
         admission: chirp::admission::Admission::new(max_calls),
         webrtc: Some(
-            WebRtc::start("127.0.0.1:0".parse().unwrap(), None)
+            WebRtc::start("127.0.0.1:0".parse().unwrap(), None, 2)
                 .await
                 .unwrap(),
         ),

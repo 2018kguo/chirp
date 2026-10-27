@@ -148,7 +148,9 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
     let mut hung_up = false;
     let mut unprompted = tokio::time::interval(UNPROMPTED_POLL);
     // Last commit sent or answered: the deadline runs from here.
-    let mut commit_progress = tokio::time::Instant::now();
+    // One timer, moved when a commit is sent or answered (not rebuilt per frame).
+    let commit_deadline = tokio::time::sleep(COMMIT_DEADLINE);
+    tokio::pin!(commit_deadline);
 
     loop {
         let input = tokio::select! {
@@ -192,7 +194,7 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
                     continue;
                 }
                 Some(Transcript::Committed(text)) => {
-                    commit_progress = tokio::time::Instant::now();
+                    commit_deadline.as_mut().reset(tokio::time::Instant::now() + COMMIT_DEADLINE);
                     state.on(Input::Committed(text))
                 }
                 Some(Transcript::Error(error)) => {
@@ -201,9 +203,9 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
                 }
                 None => anyhow::bail!("speech-to-text stream closed"),
             },
-            _ = tokio::time::sleep_until(commit_progress + COMMIT_DEADLINE), if state.pending().1 > 0 => {
+            _ = &mut commit_deadline, if state.pending().1 > 0 => {
                 tracing::warn!(commits = state.pending().1, "speech-to-text never answered; treating as empty");
-                commit_progress = tokio::time::Instant::now();
+                commit_deadline.as_mut().reset(tokio::time::Instant::now() + COMMIT_DEADLINE);
                 (0..state.pending().1).flat_map(|_| state.on(Input::Committed(String::new()))).collect()
             }
             Some(finished) = reply_done.recv() => {
@@ -242,7 +244,9 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
         for action in input {
             match action {
                 Action::Commit => {
-                    commit_progress = tokio::time::Instant::now();
+                    commit_deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + COMMIT_DEADLINE);
                     transcriber.commit().await?
                 }
                 Action::Interrupt => {
