@@ -59,3 +59,6 @@ codegen-units = 1
 # MALLOC_ARENA_MAX=2, mimalloc and jemalloc (scripts/linux_memory.sh; PLAN.md).
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
