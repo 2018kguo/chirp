@@ -93,18 +93,30 @@ where
     F: Fn() -> B + Clone + Send + Sync + 'static,
 {
     let shared = shared_from_env().await?;
-    if let Ok(port) = std::env::var("CHIRP_SIP_PORT") {
-        let sip = crate::sip::start(
-            ([0, 0, 0, 0], port.parse()?).into(),
-            ([0, 0, 0, 0], env_or("CHIRP_SIP_RTP_PORT", 7864u16)).into(),
-            Some(public_ip().await?),
-            shared.clone(),
-            make_brain.clone(),
-        )
-        .await?;
-        tracing::info!(sip = %sip.sip, rtp = %sip.rtp, "SIP listening");
-    }
+    sip_from_env(&shared, make_brain.clone()).await?;
     listen(router(shared, make_brain)).await
+}
+
+/// Answers phone calls when `CHIRP_SIP_PORT` is set (media on
+/// `CHIRP_SIP_RTP_PORT`, default 7864); a no-op otherwise.
+pub async fn sip_from_env<B, F>(shared: &Shared, make_brain: F) -> anyhow::Result<()>
+where
+    B: Brain,
+    F: Fn() -> B + Send + Sync + 'static,
+{
+    let Ok(port) = std::env::var("CHIRP_SIP_PORT") else {
+        return Ok(());
+    };
+    let sip = crate::sip::start(
+        ([0, 0, 0, 0], port.parse()?).into(),
+        ([0, 0, 0, 0], env_or("CHIRP_SIP_RTP_PORT", 7864u16)).into(),
+        Some(public_ip().await?),
+        shared.clone(),
+        make_brain,
+    )
+    .await?;
+    tracing::info!(sip = %sip.sip, rtp = %sip.rtp, "SIP listening");
+    Ok(())
 }
 
 /// The address callers reach this host at: `CHIRP_PUBLIC_ADDR`'s, else the
