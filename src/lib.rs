@@ -17,6 +17,7 @@ pub mod sse;
 pub mod turn;
 pub mod turn_taking;
 pub mod vad;
+pub mod webrtc;
 
 /// Raise the open-file soft limit to the hard limit, as Go's runtime does.
 /// Every call holds several sockets (caller, transcription, speech, brain);

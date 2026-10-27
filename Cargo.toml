@@ -16,6 +16,9 @@ dhat-heap = ["dep:dhat"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
+opus = "0.4"
+# Pure-Rust DTLS/SRTP: no native crypto build.
+str0m = { version = "0.24", default-features = false, features = ["rust-crypto"] }
 libc = "0.2"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }

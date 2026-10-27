@@ -207,3 +207,12 @@ numbers that matter, not a port.
   Frozen live calls: 4 of 4 answered (were 2 of 2 killed). The mock STT can
   enforce a message rate (`stt_max_messages_per_100ms`) for the regression
   test `call_flow::a_backlog_of_audio_is_sent_in_a_few_messages`.
+- **WebRTC transport (Oct 27 2026).** str0m (sans-IO, pure-Rust DTLS) with
+  one UDP socket and one hub task for every call; Opus at 16 kHz both ways
+  (no resampling); events on a data channel; signaling is one WHIP-style
+  POST. Server-side playout queue, flushed on interrupt. Opus cost per
+  call-second: encode 5.3 ms at complexity 10, 3.5 ms at 5 (chosen), 1.6 ms
+  at 1; decode 0.3 ms. `call::run` now takes any transport (caller audio in,
+  `ToCaller` out). Tests: a str0m peer over real UDP is heard and answered,
+  and barge-in stops playout within 100 ms (both fail on the matching
+  mutation).

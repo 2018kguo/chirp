@@ -35,6 +35,7 @@ async fn chirp_with<B: Brain>(
         elevenlabs: ElevenLabs::new("mock", format!("ws://{mocks}")).unwrap(),
         speech: SpeechPolicy::default(),
         turn_policy: Policy::default(),
+        webrtc: None,
     };
     let http = reqwest::Client::new();
     let brain_url = format!("http://{mocks}/v1");

@@ -1,8 +1,9 @@
 //! The HTTP surface: `GET /health` and `GET /v1/calls` (WebSocket upgrade).
 
 use axum::extract::{State, WebSocketUpgrade};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 
 use std::net::SocketAddr;
@@ -20,6 +21,7 @@ where
     B: Brain,
     F: Fn() -> B + Clone + Send + Sync + 'static,
 {
+    let webrtc_brain = make_brain.clone();
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route(
@@ -30,7 +32,7 @@ where
                     async move {
                         // Behind already: a new call would make every call worse.
                         if shared.turn.overloaded() {
-                            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "at capacity")
+                            return (StatusCode::SERVICE_UNAVAILABLE, "at capacity")
                                 .into_response();
                         }
                         // Callers send 640-byte frames: small buffers, and a cap
@@ -44,6 +46,29 @@ where
                     }
                 },
             ),
+        )
+        .route(
+            "/v1/webrtc",
+            post(move |State(shared): State<Shared>, offer: String| {
+                let brain = webrtc_brain();
+                async move {
+                    let Some(webrtc) = shared.webrtc.clone() else {
+                        return (StatusCode::NOT_FOUND, "WebRTC is off").into_response();
+                    };
+                    if shared.turn.overloaded() {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "at capacity").into_response();
+                    }
+                    match webrtc.answer(&offer, shared, brain).await {
+                        Ok(answer) => (
+                            StatusCode::CREATED,
+                            [(axum::http::header::CONTENT_TYPE, "application/sdp")],
+                            answer,
+                        )
+                            .into_response(),
+                        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+                    }
+                }
+            }),
         )
         .with_state(shared)
 }
@@ -97,7 +122,29 @@ pub async fn shared_from_env() -> anyhow::Result<Shared> {
         elevenlabs: ElevenLabs::from_env()?,
         speech: SpeechPolicy::default(),
         turn_policy: crate::turn_taking::Policy::default(),
+        webrtc: Some(webrtc_from_env().await?),
     })
+}
+
+/// WebRTC media on UDP `CHIRP_RTC_PORT` (default 7862), reached at
+/// `CHIRP_PUBLIC_ADDR` (default: this host's outbound address, that port).
+async fn webrtc_from_env() -> anyhow::Result<crate::webrtc::WebRtc> {
+    let port = env_or("CHIRP_RTC_PORT", 7862u16);
+    let public = match std::env::var("CHIRP_PUBLIC_ADDR") {
+        Ok(address) => address.parse()?,
+        Err(_) => SocketAddr::new(outbound_ip().await, port),
+    };
+    crate::webrtc::WebRtc::start(([0, 0, 0, 0], port).into(), Some(public)).await
+}
+
+/// The address this host sends from (no packet is sent), else loopback.
+async fn outbound_ip() -> std::net::IpAddr {
+    let probe = async {
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        socket.connect("8.8.8.8:80").await?;
+        Ok::<_, std::io::Error>(socket.local_addr()?.ip())
+    };
+    probe.await.unwrap_or([127, 0, 0, 1].into())
 }
 
 /// Serves `router` on `PORT` (default 7861) until SIGTERM.

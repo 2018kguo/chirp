@@ -39,6 +39,8 @@ pub struct Shared {
     pub elevenlabs: ElevenLabs,
     pub speech: SpeechPolicy,
     pub turn_policy: Policy,
+    /// Calls over WebRTC (`POST /v1/webrtc`), when enabled.
+    pub webrtc: Option<crate::webrtc::WebRtc>,
 }
 
 /// How much of a reply is spoken.

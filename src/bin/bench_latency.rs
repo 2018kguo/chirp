@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
         elevenlabs: ElevenLabs::new("mock", format!("ws://{mocks}"))?,
         speech: SpeechPolicy::default(),
         turn_policy: chirp::turn_taking::Policy::default(),
+        webrtc: None,
     };
     let http = reqwest::Client::new();
     let brain_url = format!("http://{mocks}/v1");

@@ -2,8 +2,8 @@
 
 A voice engine that serves many calls per process.
 
-Each call is a WebSocket carrying 16 kHz mono PCM16 in and out, plus JSON
-events. chirp listens (Silero VAD), decides when the caller has finished
+A call is a WebSocket carrying 16 kHz mono PCM16 in and out plus JSON
+events, or a WebRTC session (Opus audio, events on a data channel). chirp listens (Silero VAD), decides when the caller has finished
 (Smart Turn v3), transcribes and speaks through streaming services
 (ElevenLabs), handles barge-in, and gets its answers from a pluggable
 **brain**: any streaming chat backend, behind a two-method trait.
@@ -72,8 +72,23 @@ cargo run --release --bin call_client -- ws://127.0.0.1:7861/v1/calls question.w
 | `CHIRP_SYSTEM_PROMPT` | none | |
 | `CHIRP_VAD_THREADS` | cores / 4, at least 2 | |
 | `CHIRP_TURN_THREADS` | cores − 2 | |
+| `CHIRP_RTC_PORT` | 7862 | UDP port every WebRTC call shares |
+| `CHIRP_PUBLIC_ADDR` | this host's outbound address, that port | where callers send WebRTC media |
 | `CHIRP_MODELS_DIR` | `models` | missing models are downloaded here at startup |
 | `PORT` | 7861 | |
+
+Building needs cmake (libopus is compiled in).
+
+## Transports
+
+- **WebSocket**, `GET /v1/calls`: binary messages are 16 kHz mono PCM16 both
+  ways (20 ms frames suit), text messages are JSON events. On `interrupt`,
+  drop any reply audio not yet played.
+- **WebRTC**, `POST /v1/webrtc` with the browser's SDP offer as the body
+  (`201` with the answer, as WHIP). Offer one audio track and a data channel;
+  events arrive on it. chirp is ICE-lite with one host candidate, and paces
+  and flushes reply audio itself. One UDP socket and one task serve every
+  WebRTC call.
 
 ## Your own brain
 

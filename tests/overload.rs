@@ -26,6 +26,7 @@ async fn overloaded_calls_degrade_and_close_promptly() {
         elevenlabs: ElevenLabs::new("mock", format!("ws://{mocks}")).unwrap(),
         speech: SpeechPolicy::default(),
         turn_policy: Policy::default(),
+        webrtc: None,
     };
     let turn = shared.turn.clone();
     let http = reqwest::Client::new();
