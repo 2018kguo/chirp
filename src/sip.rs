@@ -97,7 +97,7 @@ where
     };
     let media = SocketAddr::new(config.public_ip.unwrap_or(addrs.rtp.ip()), addrs.rtp.port());
     let (to_media, from_signaling) = mpsc::channel(64);
-    let (ended_tx, ended) = mpsc::unbounded_channel();
+    let (ended_tx, ended) = mpsc::unbounded_channel::<String>();
     tokio::spawn(media_hub(rtp, from_signaling, ended_tx, config.rtp_timeout));
     tokio::spawn(signaling(
         sip,
@@ -260,8 +260,31 @@ struct Dialog {
     cseq: u32,
 }
 
+/// RFC 3261's timers: the first retransmission, and the longest gap.
+const T1: Duration = Duration::from_millis(500);
+const T2: Duration = Duration::from_secs(4);
+
+/// A 200 OK awaiting its ACK.
+struct Unacked {
+    next: tokio::time::Instant,
+    interval: Duration,
+    give_up: tokio::time::Instant,
+}
+
+impl Unacked {
+    fn new() -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            next: now + T1,
+            interval: T1,
+            give_up: now + T1 * 64,
+        }
+    }
+}
+
 enum ToMedia {
     Add {
+        call_id: String,
         remote: SocketAddr,
         law: Law,
         audio_in: mpsc::Sender<Bytes>,
@@ -275,7 +298,7 @@ async fn signaling<B, F>(
     media: SocketAddr,
     allow: Option<Vec<(IpAddr, u8)>>,
     to_media: mpsc::Sender<ToMedia>,
-    mut ended: mpsc::UnboundedReceiver<SocketAddr>,
+    mut ended: mpsc::UnboundedReceiver<String>,
     shared: Shared,
     make_brain: F,
 ) where
@@ -291,6 +314,9 @@ async fn signaling<B, F>(
     let mut dialogs: HashMap<String, Dialog> = HashMap::new();
     // Each call's media address, to its Call-ID.
     let mut by_media: HashMap<SocketAddr, String> = HashMap::new();
+    // Answers not yet ACKed (usually none), by Call-ID.
+    let mut unacked: HashMap<String, Unacked> = HashMap::new();
+    let mut retransmit = tokio::time::interval(T1 / 2);
     let mut buffer = vec![0u8; 8192];
     loop {
         tokio::select! {
@@ -314,6 +340,7 @@ async fn signaling<B, F>(
                                 let extra = format!("{contact}Content-Type: application/sdp\r\n");
                                 dialog.answer = response(&request, "200 OK", Some(&dialog.to_tag), &extra, &dialog.sdp);
                                 dialog.branch = request.branch().to_string();
+                                unacked.insert(call_id.clone(), Unacked::new());
                             }
                             Some(dialog.answer.clone())
                         } else if let Some((remote, law)) = offer {
@@ -361,7 +388,7 @@ async fn signaling<B, F>(
                                         let (audio_in, audio) = mpsc::channel::<Bytes>(64);
                                         let (to_caller, from_call) = mpsc::channel::<ToCaller>(512);
                                         let _ = to_media
-                                            .send(ToMedia::Add { remote, law, audio_in, from_call })
+                                            .send(ToMedia::Add { call_id: call_id.clone(), remote, law, audio_in, from_call })
                                             .await;
                                         let audio = futures::stream::unfold(audio, |mut audio| async move {
                                             audio.recv().await.map(|pcm| (pcm, audio))
@@ -372,6 +399,7 @@ async fn signaling<B, F>(
                                             drop(permit);
                                         });
                                         slot.insert(call_id.clone());
+                                        unacked.insert(call_id.clone(), Unacked::new());
                                         dialogs.insert(call_id, Dialog {
                                             branch: request.branch().to_string(),
                                             answer: answer.clone(),
@@ -390,8 +418,12 @@ async fn signaling<B, F>(
                             Some(response(&request, "488 Not Acceptable Here", None, "", ""))
                         }
                     }
-                    "ACK" => None,
+                    "ACK" => {
+                        unacked.remove(&call_id);
+                        None
+                    }
                     "BYE" | "CANCEL" => {
+                        unacked.remove(&call_id);
                         if let Some(dialog) = dialogs.remove(&call_id) {
                             by_media.remove(&dialog.remote_media);
                             let _ = to_media.send(ToMedia::Remove(dialog.remote_media)).await;
@@ -405,13 +437,46 @@ async fn signaling<B, F>(
                     let _ = socket.send_to(reply.as_bytes(), from).await;
                 }
             }
-            Some(remote) = ended.recv() => {
-                // The call ended on chirp's side: hang up on the caller.
-                let Some(call_id) = by_media.remove(&remote) else { continue };
+            Some(call_id) = ended.recv() => {
+                // The call ended on chirp's side: hang up on the caller. By
+                // Call-ID, so a late notice can't end a newer call that took
+                // over the same media address.
                 if let Some(mut dialog) = dialogs.remove(&call_id) {
+                    by_media.remove(&dialog.remote_media);
+                    unacked.remove(&call_id);
                     dialog.cseq += 1;
                     let bye = bye(&dialog, &call_id, &contact);
                     let _ = socket.send_to(bye.as_bytes(), dialog.caller).await;
+                }
+            }
+            _ = retransmit.tick(), if !unacked.is_empty() => {
+                // RFC 3261 13.3.1.4: over UDP a 200 OK is resent, at T1
+                // doubling to T2, until its ACK comes; a caller that never
+                // ACKs is hung up on after 64 T1.
+                let now = tokio::time::Instant::now();
+                let mut gave_up = Vec::new();
+                for (call_id, pending) in unacked.iter_mut() {
+                    if now < pending.next {
+                        continue;
+                    }
+                    let Some(dialog) = dialogs.get(call_id) else { continue };
+                    if now >= pending.give_up {
+                        gave_up.push(call_id.clone());
+                        continue;
+                    }
+                    let _ = socket.send_to(dialog.answer.as_bytes(), dialog.caller).await;
+                    pending.interval = (pending.interval * 2).min(T2);
+                    pending.next = now + pending.interval;
+                }
+                for call_id in gave_up {
+                    unacked.remove(&call_id);
+                    if let Some(mut dialog) = dialogs.remove(&call_id) {
+                        by_media.remove(&dialog.remote_media);
+                        let _ = to_media.send(ToMedia::Remove(dialog.remote_media)).await;
+                        dialog.cseq += 1;
+                        let bye = bye(&dialog, &call_id, &contact);
+                        let _ = socket.send_to(bye.as_bytes(), dialog.caller).await;
+                    }
                 }
             }
         }
@@ -454,6 +519,7 @@ fn rand_tag() -> u64 {
 // --- media -------------------------------------------------------------------
 
 struct RtpCall {
+    call_id: String,
     law: Law,
     audio_in: mpsc::Sender<Bytes>,
     playout: Playout<Encoder>,
@@ -470,7 +536,7 @@ struct RtpCall {
 async fn media_hub(
     socket: UdpSocket,
     mut from_signaling: mpsc::Receiver<ToMedia>,
-    ended: mpsc::UnboundedSender<SocketAddr>,
+    ended: mpsc::UnboundedSender<String>,
     rtp_timeout: Duration,
 ) {
     let mut calls: HashMap<SocketAddr, RtpCall> = HashMap::new();
@@ -484,7 +550,7 @@ async fn media_hub(
     loop {
         tokio::select! {
             command = from_signaling.recv() => match command {
-                Some(ToMedia::Add { remote, law, audio_in, from_call }) => {
+                Some(ToMedia::Add { call_id, remote, law, audio_in, from_call }) => {
                     let mut down = Downsampler::default();
                     let encode: Encoder = Box::new(move |frame: &[i16; FRAME]| {
                         let mut narrow = [0i16; FRAME / 2];
@@ -492,6 +558,7 @@ async fn media_hub(
                         Some(narrow.iter().map(|sample| encode(law, *sample)).collect::<Vec<u8>>().into())
                     });
                     calls.insert(remote, RtpCall {
+                        call_id,
                         law,
                         audio_in,
                         playout: Playout::new(from_call, encode),
@@ -548,8 +615,9 @@ async fn media_hub(
                     }
                 }
                 for remote in finished {
-                    calls.remove(&remote);
-                    let _ = ended.send(remote);
+                    if let Some(call) = calls.remove(&remote) {
+                        let _ = ended.send(call.call_id);
+                    }
                 }
             }
         }

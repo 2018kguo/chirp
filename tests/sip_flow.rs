@@ -97,6 +97,26 @@ fn invite(
     )
 }
 
+/// The ACK for `answer` (a 200 OK to an INVITE from `from`).
+fn ack(chirp: SocketAddr, from: SocketAddr, answer: &str) -> String {
+    let header = |name: &str| {
+        answer
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    format!(
+        "ACK sip:chirp@{chirp} SIP/2.0\r\nVia: SIP/2.0/UDP {from};branch=z9hG4bKack\r\n\
+         Max-Forwards: 70\r\nFrom: {}\r\nTo: {}\r\nCall-ID: {}\r\nCSeq: 1 ACK\r\n\
+         Content-Length: 0\r\n\r\n",
+        header("From:"),
+        header("To:"),
+        header("Call-ID:"),
+    )
+}
+
 /// The final response to a request (skipping 100 Trying), if any comes.
 async fn final_response(socket: &UdpSocket, within: Duration) -> Option<String> {
     let mut buffer = vec![0u8; 8192];
@@ -153,6 +173,10 @@ async fn a_caller_who_stops_sending_audio_is_hung_up_on() {
         .await
         .expect("an answer");
     assert!(ok.starts_with("SIP/2.0 200"), "{ok}");
+    phone
+        .send_to(ack(chirp, from, &ok).as_bytes(), chirp)
+        .await
+        .unwrap();
     // No RTP ever: chirp ends the call and says so.
     let bye = final_response(&phone, Duration::from_secs(5))
         .await
@@ -325,4 +349,39 @@ async fn a_call_the_brain_factory_refuses_is_forbidden() {
         .await
         .expect("an answer");
     assert!(refused.starts_with("SIP/2.0 403"), "{refused}");
+}
+
+/// Over UDP an answer can be lost: chirp resends its 200 OK until the
+/// caller's ACK arrives, then stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_is_resent_until_it_is_acked() {
+    let chirp = chirp_sip(Script::default(), Setup::default()).await;
+    let phone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let from = phone.local_addr().unwrap();
+    phone
+        .send_to(
+            invite(chirp, from, "lossy@1", "a", 1, 40_014).as_bytes(),
+            chirp,
+        )
+        .await
+        .unwrap();
+    let first = final_response(&phone, Duration::from_secs(5))
+        .await
+        .expect("an answer");
+    assert!(first.starts_with("SIP/2.0 200"), "{first}");
+    // Not ACKed: the same answer comes again, T1 (500 ms) later.
+    let again = final_response(&phone, Duration::from_millis(1500))
+        .await
+        .expect("the answer, resent");
+    assert_eq!(again, first);
+    phone
+        .send_to(ack(chirp, from, &first).as_bytes(), chirp)
+        .await
+        .unwrap();
+    // Drain one already in flight, then nothing more for longer than T2.
+    let _ = final_response(&phone, Duration::from_millis(200)).await;
+    assert_eq!(
+        final_response(&phone, Duration::from_millis(4500)).await,
+        None
+    );
 }
