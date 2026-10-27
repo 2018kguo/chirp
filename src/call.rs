@@ -372,3 +372,21 @@ impl Drop for AbortOnDrop {
         self.0.abort();
     }
 }
+
+#[cfg(test)]
+mod future_size {
+    use super::*;
+
+    fn size<A, B, C, D, F: std::future::Future>(_: fn(A, B, C, D) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    /// A call's future is held for its whole life: anything only briefly
+    /// needed (a TLS handshake was 10 KB of it) belongs in a box.
+    #[test]
+    fn a_call_future_stays_small() {
+        type Audio = std::pin::Pin<Box<futures::stream::Empty<Bytes>>>;
+        let bytes = size(run::<crate::openai::OpenAiBrain, Audio> as fn(_, _, _, _) -> _);
+        assert!(bytes <= 8 * 1024, "a call's future is {bytes} bytes");
+    }
+}

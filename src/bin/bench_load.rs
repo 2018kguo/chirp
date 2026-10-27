@@ -270,6 +270,8 @@ async fn main() -> Result<()> {
                 .env("CHIRP_SIP_RTP_PORT", sip_rtp_port.to_string())
                 .env("CHIRP_SIP_ALLOW", "127.0.0.1")
                 .env("CHIRP_MAX_CALLS", "100000")
+                // Exit at once when stopped, so a profiling build writes its report.
+                .env("CHIRP_DRAIN_SECS", "0")
                 .env("RUST_LOG", "warn");
             for name in [
                 "CHIRP_VAD_THREADS",

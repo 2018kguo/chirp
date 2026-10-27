@@ -116,21 +116,22 @@ impl TurnTaker {
             self.filled += 1;
             if self.filled == WINDOW {
                 self.filled = 0;
-                let window = self.window;
                 self.clock += WINDOW as u64;
-                self.window_done(&window, &mut events).await?;
+                self.window_done(&mut events).await?;
             }
         }
         Ok(events)
     }
 
-    async fn window_done(&mut self, window: &[f32], events: &mut Vec<TurnEvent>) -> Result<()> {
-        self.recent.push(window);
+    /// The window just filled (`self.window`, read in place: a copy would
+    /// sit in every call's future).
+    async fn window_done(&mut self, events: &mut Vec<TurnEvent>) -> Result<()> {
+        self.recent.push(&self.window);
         let holding = self.vad.speaking() || self.grace_until.is_some();
         if holding {
-            self.turn_audio.push(window);
+            self.turn_audio.push(&self.window);
         }
-        let transition = self.vad.push(window).await?;
+        let transition = self.vad.push(&self.window).await?;
         let quiet = self.vad.last_confidence() < crate::vad::CONFIDENCE;
         match transition {
             Some(Speech::Started) => {
