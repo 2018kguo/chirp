@@ -1,5 +1,5 @@
 //! A call over WebRTC, end to end: `client::play_webrtc` stands in for the
-//! browser (Opus, DTX, an `events` data channel) over a real UDP socket.
+//! browser (Opus, an `events` data channel) over a real UDP socket.
 
 use std::path::Path;
 use std::time::Duration;
@@ -159,4 +159,29 @@ async fn an_offer_over_the_call_limit_is_refused() {
         .await
         .unwrap();
     assert_eq!(response.status(), 503);
+}
+
+/// A caller who stops sending in silence (a muted track, Opus DTX) is still
+/// heard to finish: chirp fills the gap with silence in real time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_ends_when_the_caller_sends_nothing_in_silence() {
+    let url = chirp_webrtc(Script::default()).await;
+    let mut question =
+        client::read_wav(&root().join("tests/fixtures/turn/complete_question.wav")).unwrap();
+    let speech_end = client::speech_end(&question);
+    question.resize(8 * 16_000, 0);
+    let mut frames = client::encode_for_webrtc(&question).unwrap().to_vec();
+    for (frame, samples) in frames.iter_mut().zip(question.chunks(320)) {
+        if samples.iter().all(|sample| *sample == 0) {
+            *frame = None;
+        }
+    }
+    let count = frames.len();
+    let heard = client::play_webrtc_encoded(&url, frames.into(), count, speech_end)
+        .await
+        .unwrap();
+    assert!(
+        heard.events.iter().any(|(_, e)| e["type"] == "turn_end"),
+        "the turn never ended"
+    );
 }

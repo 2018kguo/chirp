@@ -32,7 +32,10 @@ impl CallRequest {
         self.headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
+            .and_then(|value| {
+                let (scheme, token) = value.split_once(' ')?;
+                scheme.eq_ignore_ascii_case("bearer").then_some(token)
+            })
             .or_else(|| self.query.get("token").map(String::as_str))
     }
 
@@ -76,6 +79,7 @@ mod tests {
         assert!(request(None, Some("s3cret")).has_token("s3cret"));
         assert!(!request(Some("Bearer s3cre"), None).has_token("s3cret"));
         assert!(!request(Some("Basic s3cret"), None).has_token("s3cret"));
+        assert!(request(Some("bearer s3cret"), None).has_token("s3cret"));
         assert!(!request(None, None).has_token("s3cret"));
     }
 }

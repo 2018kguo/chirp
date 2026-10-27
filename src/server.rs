@@ -142,7 +142,10 @@ pub fn require_token_from_env<B, F>(
 where
     F: Fn(&CallRequest) -> Option<B> + Clone + Send + Sync + 'static,
 {
-    let token: Option<Arc<str>> = std::env::var("CHIRP_TOKEN").ok().map(Into::into);
+    let token: Option<Arc<str>> = std::env::var("CHIRP_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(Into::into);
     move |request: &CallRequest| match &token {
         Some(token) if !request.has_token(token) => None,
         _ => make_brain(request),
@@ -298,12 +301,16 @@ pub async fn listen(router: Router, admission: Admission) -> anyhow::Result<()> 
     let address: SocketAddr = ([0, 0, 0, 0], env_or("PORT", 7861u16)).into();
     tracing::info!(%address, "chirp listening");
     // On SIGTERM, stop accepting connections, then drain.
-    let terminate = async {
+    let closing = admission.clone();
+    let terminate = async move {
         if let Ok(mut signal) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         {
             signal.recv().await;
         }
+        // At once, on every transport: HTTP connections may take a while to
+        // close, and SIP doesn't wait for them.
+        closing.close();
     };
     let listener = nodelay(tokio::net::TcpListener::bind(address).await?);
     // Peer addresses reach the router (`CallRequest::remote`).
