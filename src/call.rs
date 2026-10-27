@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
-use futures::{FutureExt, SinkExt, StreamExt};
+use bytes::Bytes;
+use futures::{FutureExt, SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -58,34 +59,65 @@ impl Default for SpeechPolicy {
     }
 }
 
-enum ToClient {
+/// What a call sends its caller: 16 kHz mono PCM16 audio, as fast as it is
+/// made (the transport paces playback), and JSON events. `interrupt` means
+/// drop any audio not yet played.
+pub enum ToCaller {
     Audio(Vec<u8>),
     Event(Value),
 }
 
-pub async fn run<B: Brain>(socket: WebSocket, shared: Shared, brain: B) {
-    if let Err(error) = run_inner(socket, shared, Arc::new(brain)).await {
+/// Serves one call on any transport: `audio` is the caller's 16 kHz mono
+/// PCM16 in any frame size, ending when they hang up; everything for them
+/// goes to `to_caller`, which is dropped when the call ends.
+pub async fn run<B, S>(audio: S, to_caller: mpsc::Sender<ToCaller>, shared: Shared, brain: B)
+where
+    B: Brain,
+    S: Stream<Item = Bytes> + Unpin + Send,
+{
+    if let Err(error) = run_inner(audio, to_caller, shared, Arc::new(brain)).await {
         tracing::warn!(%error, "call ended with an error");
     }
 }
 
-async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -> Result<()> {
-    let (mut client_tx, mut client_rx) = socket.split();
-    let (to_client, mut outbox) = mpsc::channel::<ToClient>(512);
-    // Every task this call starts is aborted when the call ends, on any path:
-    // a reply or writer left running would hold the client's socket open.
+/// A call over a WebSocket: binary messages are PCM16 both ways, events are
+/// text.
+pub async fn run_websocket<B: Brain>(socket: WebSocket, shared: Shared, brain: B) {
+    let (mut client_tx, client_rx) = socket.split();
+    let (to_caller, mut outbox) = mpsc::channel::<ToCaller>(512);
     let mut writer = AbortOnDrop(tokio::spawn(async move {
         while let Some(message) = outbox.recv().await {
             let message = match message {
-                ToClient::Audio(pcm) => Message::Binary(pcm.into()),
-                ToClient::Event(event) => Message::Text(event.to_string().into()),
+                ToCaller::Audio(pcm) => Message::Binary(pcm.into()),
+                ToCaller::Event(event) => Message::Text(event.to_string().into()),
             };
             if client_tx.send(message).await.is_err() {
                 break;
             }
         }
     }));
-    let event = |value: Value| ToClient::Event(value);
+    let audio = client_rx
+        .take_while(|message| std::future::ready(message.is_ok()))
+        .filter_map(|message| {
+            std::future::ready(match message {
+                Ok(Message::Binary(pcm)) => Some(pcm),
+                _ => None,
+            })
+        });
+    run(Box::pin(audio), to_caller, shared, brain).await;
+    // The caller hung up: let what is already queued reach them.
+    let _ = (&mut writer.0).await;
+}
+
+async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
+    mut client_rx: S,
+    to_client: mpsc::Sender<ToCaller>,
+    shared: Shared,
+    brain: Arc<B>,
+) -> Result<()> {
+    // Every task this call starts is aborted when the call ends, on any path:
+    // a reply left running would hold the caller's connection open.
+    let event = |value: Value| ToCaller::Event(value);
     let _ = to_client.send(event(json!({ "type": "ready" }))).await;
 
     let (mut transcriber, mut transcripts) = shared.elevenlabs.transcriber().await?;
@@ -116,23 +148,21 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
 
     loop {
         let input = tokio::select! {
-            message = client_rx.next() => {
-                let Some(Ok(message)) = message else { break };
-                let Message::Binary(pcm) = message else { continue };
+            pcm = client_rx.next() => {
+                let Some(pcm) = pcm else { break };
                 // Frames that queued while this loop was held up (a slow
                 // host) go to speech-to-text as one message: ElevenLabs ends
                 // a session flooded with hundreds of 20 ms messages at once.
                 backlog.clear();
                 while backlog.len() + pcm.len() < MAX_COALESCED_BYTES {
                     match client_rx.next().now_or_never() {
-                        Some(Some(Ok(Message::Binary(more)))) => {
+                        Some(Some(more)) => {
                             if backlog.is_empty() {
                                 backlog.extend_from_slice(&pcm);
                             }
                             backlog.extend_from_slice(&more);
                         }
-                        Some(Some(Ok(_))) => {}
-                        Some(_) => {
+                        Some(None) => {
                             hung_up = true;
                             break;
                         }
@@ -262,17 +292,14 @@ async fn run_inner<B: Brain>(socket: WebSocket, shared: Shared, brain: Arc<B>) -
         }
     }
     drop(speaking);
-    drop(to_client);
-    // The caller hung up: let what is already queued reach them.
-    let _ = (&mut writer.0).await;
     Ok(())
 }
 
-async fn report(result: Result<()>, to_client: &mpsc::Sender<ToClient>) {
+async fn report(result: Result<()>, to_client: &mpsc::Sender<ToCaller>) {
     if let Err(error) = result {
         tracing::warn!(%error, "reply failed");
         let _ = to_client
-            .send(ToClient::Event(
+            .send(ToCaller::Event(
                 json!({ "type": "error", "message": error.to_string() }),
             ))
             .await;
@@ -285,7 +312,7 @@ async fn speak(
     mut reply: Reply,
     (mut speaker, mut audio): (crate::elevenlabs::Speaker, mpsc::Receiver<Vec<u8>>),
     policy: &SpeechPolicy,
-    to_client: &mpsc::Sender<ToClient>,
+    to_client: &mpsc::Sender<ToCaller>,
     turn_ended_at: Option<Instant>,
 ) -> Result<()> {
     let forward_to = to_client.clone();
@@ -299,13 +326,13 @@ async fn speak(
                 if let Some(start) = turn_ended_at {
                     let ms = start.elapsed().as_millis() as u64;
                     let _ = forward_to
-                        .send(ToClient::Event(
+                        .send(ToCaller::Event(
                             json!({ "type": "metrics", "firstAudioMs": ms }),
                         ))
                         .await;
                 }
             }
-            if forward_to.send(ToClient::Audio(pcm)).await.is_err() {
+            if forward_to.send(ToCaller::Audio(pcm)).await.is_err() {
                 break;
             }
         }

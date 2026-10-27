@@ -39,7 +39,7 @@ where
                             .read_buffer_size(4 * 1024)
                             .write_buffer_size(0)
                             .max_message_size(64 * 1024)
-                            .on_upgrade(move |socket| call::run(socket, shared, brain))
+                            .on_upgrade(move |socket| call::run_websocket(socket, shared, brain))
                             .into_response()
                     }
                 },
