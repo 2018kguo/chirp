@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.0 (2026-10-27)
+
+### Breaking
+
+- **Brain factories see the call.** `make_brain` is now
+  `Fn(&CallRequest) -> Option<B>`: it gets the transport, the caller's
+  address, the HTTP headers and query (for SIP, the INVITE's `from`, `to`
+  and `call_id`), so one server can give each caller their own brain.
+  Returning `None` refuses the call (403) before any paid session opens.
+  Migrate `serve(|| brain)` to `serve(|_| Some(brain))`.
+- `server::listen` takes the `Admission` too (`shared.admission.clone()`),
+  so it can drain.
+
+### Added
+
+- **Tokens:** set `CHIRP_TOKEN` and `serve` refuses WebSocket and WebRTC
+  callers without it (`Authorization: Bearer`, or `?token=` from a
+  browser). `server::require_token_from_env` wraps your own factory the
+  same way. SIP stays behind `CHIRP_SIP_ALLOW`.
+- **Graceful drain:** on SIGTERM, new calls are refused on every transport
+  and calls in progress get `CHIRP_DRAIN_SECS` (default 30) to end.
+- **`GET /metrics`** (Prometheus): calls active, started, refused (by
+  reason) and failed; reply errors; turns by what ended them; mean time
+  from end of turn to first reply audio; Smart Turn queue wait.
+
+### Faster and smaller
+
+Interleaved A/B at 50 calls (live heap per call):
+
+- **Memory:** WebSocket 130 → 112 KB, SIP 132 → 114 KB, WebRTC 268 →
+  218 KB. The speech-to-text TLS handshake (~10 KB) no longer sits in every
+  call's future for its whole life, WebRTC negotiates no congestion
+  feedback it never used, and str0m's 10 KB session state is boxed.
+- **WebRTC turns end 10 ms sooner** (p50 765 → 755 ms): a header-only Opus
+  packet (the browser entering DTX) means silence now, without first
+  waiting out network jitter.
+
+
 ## 0.1.0 (2026-10-27)
 
 The first release: a voice engine that serves many calls per process.
