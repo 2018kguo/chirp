@@ -267,3 +267,10 @@ numbers that matter, not a port.
   WebRTC at 1,000 calls refused 410 with the box at load 16.6 of 16 vCPUs:
   half of it was the benchmark's own callers encoding Opus, so that run
   measures the harness, not chirp.
+- **WebRTC scales linearly (Oct 27 2026).** With the benchmark's callers
+  sharing one encoding of the question (they used half the box), WebRTC on
+  the c7a.4xlarge: 800 calls, 0 refused, p99 903 ms, 12.9 ms CPU per
+  call-second; 1,000 calls refused 122 with chirp at 11.4 cores and the box
+  at load 16.5 (CPU-bound, as WebSocket is at ~1,000). CPU per call-second
+  by calls, WebRTC 100/300/600/800: 14.2 / 13.8 / 13.0 / 12.9; SIP
+  100/300/600/1,000: 10.6 / 10.6 / 10.4 / 10.4. Flat: each call costs O(1).

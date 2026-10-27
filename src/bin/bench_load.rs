@@ -84,12 +84,18 @@ async fn converse_rtc(
     let outcome = if transport == "chirp-sip" {
         chirp::client::play_sip(sip, audio).await?
     } else {
-        chirp::client::play_webrtc(
-            &url.replace("ws://", "http://")
-                .replace("/v1/calls", "/v1/webrtc"),
-            audio,
-        )
-        .await?
+        // Encoded once for every caller: the callers' own Opus work would
+        // otherwise compete with the server being measured.
+        static TURN: std::sync::OnceLock<std::sync::Arc<[Option<bytes::Bytes>]>> =
+            std::sync::OnceLock::new();
+        let frames = TURN
+            .get_or_init(|| chirp::client::encode_for_webrtc(&turn).expect("Opus"))
+            .clone();
+        let url = url
+            .replace("ws://", "http://")
+            .replace("/v1/calls", "/v1/webrtc");
+        chirp::client::play_webrtc_encoded(&url, frames, audio.len().div_ceil(320), speech_end)
+            .await?
     };
     if let Some((_, error)) = outcome.events.iter().find(|(_, e)| e["type"] == "error") {
         bail!("error event: {}", error["message"]);

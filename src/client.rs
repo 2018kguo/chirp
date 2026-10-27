@@ -140,6 +140,37 @@ pub fn speech_end(speech: &[i16]) -> Duration {
 /// Opus in 20 ms frames, nothing sent while silent (DTX), events on an
 /// `events` data channel. Hangs up when the audio ends.
 pub async fn play_webrtc(url: &str, audio: Vec<i16>) -> Result<Outcome> {
+    let frames = encode_for_webrtc(&audio)?;
+    let count = frames.len();
+    play_webrtc_encoded(url, frames, count, speech_end(&audio)).await
+}
+
+/// `audio` as the Opus frames a browser would send: `None` for silence,
+/// which it doesn't send (DTX). Encode once, play to many callers.
+pub fn encode_for_webrtc(audio: &[i16]) -> Result<std::sync::Arc<[Option<bytes::Bytes>]>> {
+    let mut encoder = opus::Encoder::new(16_000, opus::Channels::Mono, opus::Application::Voip)?;
+    let mut packet = vec![0u8; 1500];
+    audio
+        .chunks(320)
+        .map(|frame| {
+            let mut padded = [0i16; 320];
+            padded[..frame.len()].copy_from_slice(frame);
+            if padded.iter().all(|sample| *sample == 0) {
+                return Ok(None);
+            }
+            let length = encoder.encode(&padded, &mut packet)?;
+            Ok(Some(bytes::Bytes::copy_from_slice(&packet[..length])))
+        })
+        .collect()
+}
+
+/// Plays `count` frames of `frames` (cycling) over WebRTC, as `play_webrtc`.
+pub async fn play_webrtc_encoded(
+    url: &str,
+    frames: std::sync::Arc<[Option<bytes::Bytes>]>,
+    count: usize,
+    speech_end: Duration,
+) -> Result<Outcome> {
     use str0m::change::SdpAnswer;
     use str0m::format::Codec;
     use str0m::media::{Direction, Frequency, MediaKind, MediaTime};
@@ -171,12 +202,10 @@ pub async fn play_webrtc(url: &str, audio: Vec<i16>) -> Result<Outcome> {
     let answer = SdpAnswer::from_sdp_string(&response.text().await?)?;
     rtc.sdp_api().accept_answer(pending, answer)?;
 
-    let mut encoder = opus::Encoder::new(16_000, opus::Channels::Mono, opus::Application::Voip)?;
     let mut decoder = opus::Decoder::new(16_000, opus::Channels::Mono)?;
-    let (mut decoded, mut packet, mut buffer) =
-        (vec![0i16; 1920], vec![0u8; 1500], vec![0u8; 2000]);
+    let (mut decoded, mut buffer) = (vec![0i16; 1920], vec![0u8; 2000]);
     let mut outcome = Outcome {
-        speech_end: speech_end(&audio),
+        speech_end,
         events: Vec::new(),
         first_audio: None,
         audio_at: Vec::new(),
@@ -185,7 +214,7 @@ pub async fn play_webrtc(url: &str, audio: Vec<i16>) -> Result<Outcome> {
         closed: Duration::ZERO,
         rtp: Vec::new(),
     };
-    let mut frames = audio.chunks(320);
+    let mut frames = frames.iter().cycle().take(count);
     let mut rtp_time = 0u64;
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     let started = Instant::now();
@@ -222,17 +251,12 @@ pub async fn play_webrtc(url: &str, audio: Vec<i16>) -> Result<Outcome> {
             }
             _ = tick.tick() => {
                 let Some(frame) = frames.next() else { break };
-                let mut padded = [0i16; 320];
-                padded[..frame.len()].copy_from_slice(frame);
                 // Like a browser's Opus with DTX: silence is not sent.
-                if padded.iter().any(|sample| *sample != 0) {
-                    if let Some(writer) = rtc.writer(mid) {
-                        let pt = writer.payload_params().find(|p| p.spec().codec == Codec::Opus).map(|p| p.pt());
-                        if let Some(pt) = pt {
-                            let length = encoder.encode(&padded, &mut packet)?;
-                            let time = MediaTime::new(rtp_time, Frequency::FORTY_EIGHT_KHZ);
-                            let _ = writer.write(pt, Instant::now(), time, packet[..length].to_vec());
-                        }
+                if let (Some(opus), Some(writer)) = (frame, rtc.writer(mid)) {
+                    let pt = writer.payload_params().find(|p| p.spec().codec == Codec::Opus).map(|p| p.pt());
+                    if let Some(pt) = pt {
+                        let time = MediaTime::new(rtp_time, Frequency::FORTY_EIGHT_KHZ);
+                        let _ = writer.write(pt, Instant::now(), time, opus.to_vec());
                     }
                 }
                 rtp_time += 960;
