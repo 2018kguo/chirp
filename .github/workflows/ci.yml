@@ -22,4 +22,9 @@ jobs:
       - run: ./models/fetch.sh
       - run: cargo fmt --check
       - run: cargo clippy --release --all-targets --locked -- -D warnings
+      - uses: astral-sh/setup-uv@v5
+      # Smart Turn's int8 kernels round differently per CPU (ARM dot product,
+      # x86 VNNI), so the same-ORT reference turn_parity checks against is
+      # recomputed here, on the machine running the test.
+      - run: uv run --project reference python scripts/turn_reference.py
       - run: cargo test --release --locked
