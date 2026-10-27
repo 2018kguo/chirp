@@ -423,22 +423,33 @@ async fn signaling<B, F>(
                             Some(response(&request, "488 Not Acceptable Here", None, "", ""))
                         }
                     }
+                    // In-dialog requests must carry chirp's To tag, which only
+                    // the caller saw (in the 200 OK): knowing a Call-ID isn't
+                    // enough to stop an answer's retransmission or end a call.
                     "ACK" => {
+                        let ours = dialogs.get(&call_id).is_some_and(|dialog| has_to_tag(&request, &dialog.to_tag));
                         // A late ACK for an earlier INVITE leaves a
                         // re-INVITE's answer pending.
-                        if unacked.get(&call_id).is_some_and(|pending| pending.cseq == cseq_number(&request)) {
+                        if ours && unacked.get(&call_id).is_some_and(|pending| pending.cseq == cseq_number(&request)) {
                             unacked.remove(&call_id);
                         }
                         None
                     }
-                    "BYE" | "CANCEL" => {
-                        unacked.remove(&call_id);
-                        if let Some(dialog) = dialogs.remove(&call_id) {
-                            by_media.remove(&dialog.remote_media);
-                            let _ = to_media.send(ToMedia::Remove(dialog.remote_media)).await;
+                    "BYE" => match dialogs.get(&call_id) {
+                        Some(dialog) if has_to_tag(&request, &dialog.to_tag) => {
+                            unacked.remove(&call_id);
+                            let remote = dialog.remote_media;
+                            dialogs.remove(&call_id);
+                            by_media.remove(&remote);
+                            let _ = to_media.send(ToMedia::Remove(remote)).await;
+                            Some(response(&request, "200 OK", None, "", ""))
                         }
-                        Some(response(&request, "200 OK", None, "", ""))
-                    }
+                        _ => Some(response(&request, "481 Call/Transaction Does Not Exist", None, "", "")),
+                    },
+                    // Every INVITE is answered at once, so a CANCEL is always
+                    // too late and changes nothing (RFC 3261 9.2); the caller
+                    // ends the call with ACK and BYE.
+                    "CANCEL" => Some(response(&request, "200 OK", None, "", "")),
                     "OPTIONS" => Some(response(&request, "200 OK", None, &contact, "")),
                     _ => Some(response(&request, "501 Not Implemented", None, "", "")),
                 };
@@ -493,6 +504,14 @@ async fn signaling<B, F>(
             }
         }
     }
+}
+
+/// Whether `request`'s To header carries `tag`.
+fn has_to_tag(request: &Message, tag: &str) -> bool {
+    request
+        .header("To")
+        .and_then(|to| to.split(";tag=").nth(1))
+        .is_some_and(|value| value.split(';').next() == Some(tag))
 }
 
 /// A request's CSeq number (`CSeq: 2 INVITE` -> 2).
