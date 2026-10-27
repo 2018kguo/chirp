@@ -27,10 +27,9 @@ use tokio::sync::mpsc;
 
 use crate::brain::Brain;
 use crate::call::{self, Shared, ToCaller};
+use crate::playout::{Playout, FRAME};
 
-/// 20 ms at 16 kHz: one Opus frame, as calls hear and speak.
-const FRAME: usize = 320;
-/// The same 20 ms on Opus's RTP clock, which is always 48 kHz.
+/// 20 ms on Opus's RTP clock, which is always 48 kHz.
 const FRAME_RTP_TICKS: u64 = 960;
 
 /// The shared socket's hub; cloning shares it.
@@ -78,8 +77,7 @@ impl WebRtc {
         let peer = Peer {
             rtc,
             audio_in: Some(audio_in),
-            from_call,
-            call_ended: false,
+            playout: Playout::new(from_call),
             decoder: opus::Decoder::new(16_000, Channels::Mono)?,
             encoder,
             decoded: vec![0; FRAME * 6],
@@ -88,7 +86,6 @@ impl WebRtc {
             pt: None,
             channel: None,
             events: VecDeque::new(),
-            playout: VecDeque::new(),
             rtp_time: 0,
         };
         self.peers
@@ -107,8 +104,7 @@ struct Peer {
     rtc: Rtc,
     /// The call's audio; dropped (ending the call) when the peer goes away.
     audio_in: Option<mpsc::Sender<Bytes>>,
-    from_call: mpsc::Receiver<ToCaller>,
-    call_ended: bool,
+    playout: Playout,
     decoder: opus::Decoder,
     encoder: opus::Encoder,
     decoded: Vec<i16>,
@@ -118,8 +114,6 @@ struct Peer {
     channel: Option<ChannelId>,
     /// Events not yet sent (the data channel may not be open yet).
     events: VecDeque<String>,
-    /// Reply audio not yet played, 16 kHz.
-    playout: VecDeque<i16>,
     rtp_time: u64,
 }
 
@@ -170,25 +164,9 @@ impl Peer {
 
     /// Every 20 ms: take what the call sent, send events, play one frame.
     fn pace(&mut self, now: Instant) {
-        loop {
-            match self.from_call.try_recv() {
-                Ok(ToCaller::Audio(pcm)) => self.playout.extend(
-                    pcm.chunks_exact(2)
-                        .map(|b| i16::from_le_bytes([b[0], b[1]])),
-                ),
-                Ok(ToCaller::Event(event)) => {
-                    if event["type"] == "interrupt" {
-                        self.playout.clear();
-                    }
-                    self.events.push_back(event.to_string());
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    self.call_ended = true;
-                    break;
-                }
-            }
-        }
+        let events = &mut self.events;
+        self.playout
+            .take(|event| events.push_back(event.to_string()));
         if let Some(id) = self.channel {
             while let Some(event) = self.events.front() {
                 match self
@@ -203,26 +181,18 @@ impl Peer {
                 }
             }
         }
-        self.play_frame(now);
-        // The call is over and everything it said has been played.
-        if self.call_ended && self.playout.is_empty() && self.events.is_empty() {
+        if let Some(frame) = self.playout.frame() {
+            self.play(&frame, now);
+        }
+        // The call is over and everything it said has been delivered.
+        if self.playout.finished() && self.events.is_empty() {
             self.rtc.disconnect();
         }
     }
 
-    fn play_frame(&mut self, now: Instant) {
-        if self.playout.is_empty() {
-            return;
-        }
+    fn play(&mut self, frame: &[i16], now: Instant) {
         let Some(mid) = self.mid else { return };
-        let mut frame = [0i16; FRAME];
-        for (slot, sample) in frame
-            .iter_mut()
-            .zip(self.playout.drain(..FRAME.min(self.playout.len())))
-        {
-            *slot = sample;
-        }
-        let Ok(length) = self.encoder.encode(&frame, &mut self.encoded) else {
+        let Ok(length) = self.encoder.encode(frame, &mut self.encoded) else {
             return;
         };
         let Some(writer) = self.rtc.writer(mid) else {

@@ -216,3 +216,12 @@ numbers that matter, not a port.
   `ToCaller` out). Tests: a str0m peer over real UDP is heard and answered,
   and barge-in stops playout within 100 ms (both fail on the matching
   mutation).
+- **SIP transport (Oct 27 2026).** A minimal UAS (INVITE/ACK/BYE/OPTIONS,
+  retransmitted INVITEs answered from the dialog, BYE sent when chirp ends a
+  call) and G.711 RTP on one shared socket keyed by the caller's media
+  address. 8 -> 16 kHz by interpolation in; out, an 11-tap half-band
+  low-pass then decimation. Shares the server-paced `Playout` with WebRTC.
+  Tested end to end with an in-test softphone (independent μ-law encoder);
+  fails when inbound audio is silenced. Not yet: digest auth, TCP/TLS,
+  200 OK retransmission timers, NAT latching, DTMF, hold. No carrier account
+  yet, so no real phone call has been placed.

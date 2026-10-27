@@ -3,7 +3,8 @@
 A voice engine that serves many calls per process.
 
 A call is a WebSocket carrying 16 kHz mono PCM16 in and out plus JSON
-events, or a WebRTC session (Opus audio, events on a data channel). chirp listens (Silero VAD), decides when the caller has finished
+events, a WebRTC session (Opus audio, events on a data channel), or a phone
+call over SIP (G.711). chirp listens (Silero VAD), decides when the caller has finished
 (Smart Turn v3), transcribes and speaks through streaming services
 (ElevenLabs), handles barge-in, and gets its answers from a pluggable
 **brain**: any streaming chat backend, behind a two-method trait.
@@ -74,6 +75,8 @@ cargo run --release --bin call_client -- ws://127.0.0.1:7861/v1/calls question.w
 | `CHIRP_TURN_THREADS` | cores − 2 | |
 | `CHIRP_RTC_PORT` | 7862 | UDP port every WebRTC call shares |
 | `CHIRP_PUBLIC_ADDR` | this host's outbound address, that port | where callers send WebRTC media |
+| `CHIRP_SIP_PORT` | off | UDP port to answer SIP calls on (e.g. 5060) |
+| `CHIRP_SIP_RTP_PORT` | 7864 | UDP port every phone call's audio shares |
 | `CHIRP_MODELS_DIR` | `models` | missing models are downloaded here at startup |
 | `PORT` | 7861 | |
 
@@ -89,6 +92,12 @@ Building needs cmake (libopus is compiled in).
   events arrive on it. chirp is ICE-lite with one host candidate, and paces
   and flushes reply audio itself. One UDP socket and one task serve every
   WebRTC call.
+- **SIP** (phone calls), when `CHIRP_SIP_PORT` is set: a SIP trunk or
+  softphone sends an INVITE with G.711 (PCMU or PCMA) offered; chirp answers
+  and every call's RTP shares one socket. It is a minimal user agent server:
+  UDP only, no digest authentication (allow-list the trunk's addresses), no
+  200 OK retransmission, no hold or re-INVITE, no DTMF, and media must come
+  from the address in the caller's SDP (no NAT latching).
 
 ## Your own brain
 

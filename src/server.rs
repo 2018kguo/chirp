@@ -92,7 +92,28 @@ where
     B: Brain,
     F: Fn() -> B + Clone + Send + Sync + 'static,
 {
-    listen(router(shared_from_env().await?, make_brain)).await
+    let shared = shared_from_env().await?;
+    if let Ok(port) = std::env::var("CHIRP_SIP_PORT") {
+        let sip = crate::sip::start(
+            ([0, 0, 0, 0], port.parse()?).into(),
+            ([0, 0, 0, 0], env_or("CHIRP_SIP_RTP_PORT", 7864u16)).into(),
+            Some(public_ip().await?),
+            shared.clone(),
+            make_brain.clone(),
+        )
+        .await?;
+        tracing::info!(sip = %sip.sip, rtp = %sip.rtp, "SIP listening");
+    }
+    listen(router(shared, make_brain)).await
+}
+
+/// The address callers reach this host at: `CHIRP_PUBLIC_ADDR`'s, else the
+/// outbound one.
+async fn public_ip() -> anyhow::Result<std::net::IpAddr> {
+    Ok(match std::env::var("CHIRP_PUBLIC_ADDR") {
+        Ok(address) => address.parse::<SocketAddr>()?.ip(),
+        Err(_) => outbound_ip().await,
+    })
 }
 
 /// The models, speech services and policies `serve` uses, from the
