@@ -133,11 +133,11 @@ chirp::server::serve(|_| Some(Echo)).await
 # }
 ```
 
-To mount the call routes beside your own, build them with
-`chirp::server::router(chirp::server::shared_from_env().await?, make_brain)`
+To mount the call routes beside your own, take `shared_from_env().await?`,
+build the routes with `chirp::server::router(shared.clone(), make_brain)`,
 and serve the combined axum `Router` with
-`chirp::server::listen(router, shared.admission.clone())`
-(`serve` also wraps `make_brain` in `require_token_from_env`);
+`chirp::server::listen(router, shared.admission.clone())` (`serve` also
+wraps `make_brain` in `require_token_from_env`);
 `chirp::server::sip_from_env` adds phone calls the same way `serve` does.
 
 `ReplyEvent::Progress` speaks a short status line (for example while a tool
