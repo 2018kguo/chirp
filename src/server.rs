@@ -67,6 +67,12 @@ where
     B: Brain,
     F: Fn() -> B + Clone + Send + Sync + 'static,
 {
+    listen(router(shared_from_env().await?, make_brain)).await
+}
+
+/// The models, speech services and policies `serve` uses, from the
+/// environment; for mounting [`router`] beside your own routes.
+pub async fn shared_from_env() -> anyhow::Result<Shared> {
     crate::raise_fd_limit();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let models =
@@ -76,7 +82,7 @@ where
     // On a 16-vCPU c7a, half the cores for Smart Turn refused 388 of 1,000
     // calls; all but two served all 1,000 (PLAN.md).
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
-    let shared = Shared {
+    Ok(Shared {
         vad: VadModel::spawn_threads(
             &models.join(crate::models::VAD),
             // ~1 core per 1,000 calls, but 2 threads ran at their limit
@@ -91,8 +97,11 @@ where
         elevenlabs: ElevenLabs::from_env()?,
         speech: SpeechPolicy::default(),
         turn_policy: crate::turn_taking::Policy::default(),
-    };
-    let router = router(shared, make_brain);
+    })
+}
+
+/// Serves `router` on `PORT` (default 7861) until SIGTERM.
+pub async fn listen(router: Router) -> anyhow::Result<()> {
     #[cfg(feature = "heap-stats")]
     let router = router.route(
         "/debug/heap",

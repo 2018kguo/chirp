@@ -99,8 +99,9 @@ chirp::server::serve(|| Echo).await
 # }
 ```
 
-`chirp::server::router` gives you the routes instead, to mount in your own
-axum app.
+To mount the call routes beside your own, build them with
+`chirp::server::router(chirp::server::shared_from_env().await?, make_brain)`
+and serve the combined axum `Router` with `chirp::server::listen`.
 
 `ReplyEvent::Progress` speaks a short status line (for example while a tool
 runs), at most once each. `Brain::unprompted` lets the brain speak something
