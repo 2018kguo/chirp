@@ -1,6 +1,11 @@
-# chirp
-
-A voice engine that serves many calls per process.
+<h1 align="center">chirp</h1>
+<p align="center">A voice engine that serves many calls per process.</p>
+<p align="center">
+  <a href="#run">Get started</a> ·
+  <a href="#design">Design</a> ·
+  <a href="#how-it-compares">Benchmarks</a> ·
+  <a href="#models">Models</a>
+</p>
 
 A call is a WebSocket carrying 16 kHz mono PCM16 in and out plus JSON
 events, a WebRTC session (Opus audio, events on a data channel), or a phone
@@ -17,7 +22,7 @@ caller ◄── audio ◄── TTS ◄── speakable text ◄── brain (y
 
 ## How it compares
 
-Measured against Pipecat 1.13 running the same models on the same machine,
+Measured against Pipecat running the same models on the same machine,
 with scripted mock STT/TTS/LLM services so only the engine differs. Numbers
 are from an AWS c7a.4xlarge (16 vCPU); [PLAN.md](PLAN.md) has every
 measurement, its method, and what was tried and rejected.
