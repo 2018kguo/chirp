@@ -309,3 +309,16 @@ numbers that matter, not a port.
   35.7 / 35.8 / 38.2 (arena on; off is the same within 1 ms). Its GEMMs
   are already large (800 frames, 400 positions after the conv), so a batch
   only adds queueing delay. Smart Turn stays one decision per run.
+- **Public benchmarks (Oct 29 2026, `bench/`).** Big Bench Audio (100 of
+  1,000, 25 per category) and Full-Duplex-Bench v1/v1.5 subsets, with real
+  ElevenLabs and `gpt-4.1`. Found and fixed: the 350-character spoken cap
+  cut answers (53 -> ~70 of 100); premature turn ends at sentence pauses
+  answered fragments (merged via `Utterance::continues`: 67.6 -> 75.6, 5
+  runs each, interleaved); ElevenLabs closed sessions on commits <~220 ms
+  apart (10/40 natural calls died; paced to 500 ms: 0/40); Pipecat's 2.5 s
+  grace made natural turn-taking slow (1 s: 2.54 -> 1.59 s, take-overs
+  unchanged on 353 pause samples). Text-only `gpt-4.1` on the same 100
+  questions: 79, so chirp's pipeline now costs ~3 points. **Rejected:**
+  nothing yet. **Open:** backchannels stop the reply (v1.5 user_backchannel
+  C_UNKNOWN 0.68); Smart Turn ends ~10 turns per long read question (merged
+  now, but each starts a reply); τ-Voice needs caller-run tools.
