@@ -14,6 +14,10 @@ pub struct Utterance {
     /// 1 for the call's first turn. Stable across a retried reply, so a brain
     /// can derive idempotency keys from it.
     pub index: u32,
+    /// The caller went on talking over the previous reply before hearing a
+    /// second of it: that turn end was premature (a pause mid-thought), so
+    /// this text continues the previous utterance.
+    pub continues: bool,
 }
 
 /// What a reply asks chirp to say.

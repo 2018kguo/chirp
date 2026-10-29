@@ -155,6 +155,11 @@ and serve the combined axum `Router` with
 wraps `make_brain` in `require_token_from_env`);
 `chirp::server::sip_from_env` adds phone calls the same way `serve` does.
 
+`Utterance::continues` is set when the caller talked over the previous
+reply before hearing a second of it: the turn end was a pause mid-thought,
+so the text continues the previous utterance (`OpenAiBrain` merges the two
+and drops the reply that was cut off).
+
 `ReplyEvent::Progress` speaks a short status line (for example while a tool
 runs), at most once each. `Brain::unprompted` lets the brain speak something
 the caller didn't ask for, such as a result that finished later; chirp polls
