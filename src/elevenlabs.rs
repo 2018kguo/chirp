@@ -106,7 +106,21 @@ impl ElevenLabs {
         let (sink, mut stream) = socket.split();
         let (events, received) = mpsc::channel(64);
         tokio::spawn(async move {
-            while let Some(Ok(message)) = stream.next().await {
+            loop {
+                let message = match stream.next().await {
+                    Some(Ok(message)) => message,
+                    // The connection failed or just ended: say how.
+                    failure => {
+                        let why = match failure {
+                            Some(Err(error)) => {
+                                format!("speech-to-text connection failed: {error}")
+                            }
+                            _ => "speech-to-text connection ended without a close frame".into(),
+                        };
+                        let _ = events.send(Transcript::Error(why)).await;
+                        break;
+                    }
+                };
                 let text = match message {
                     Message::Text(text) => text,
                     // ElevenLabs ending the session: say why, or the call
