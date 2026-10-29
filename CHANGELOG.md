@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.4.0 (2026-10-29)
+
+Fixes found by running two public speech-to-speech benchmarks against chirp
+with real providers (ElevenLabs, `gpt-4.1` as the brain): Big Bench Audio
+(100 questions) and Full-Duplex-Bench v1/v1.5 (`bench/` has the harnesses).
+
+### Breaking
+
+- **`Utterance::continues`.** When the caller talks over a reply before
+  hearing a second of it, the turn end was a pause mid-thought: the next
+  utterance says it continues the previous one, and `OpenAiBrain` merges the
+  two and drops the reply that was cut off. Big Bench Audio: 75.6 vs 67.6 of
+  100 (mean of 5 runs each; it won all 3 interleaved pairs).
+- **No spoken cap by default.** Replies used to stop after 350 characters
+  with " The rest is in the transcript.", which on Big Bench Audio cut 24 of
+  25 web-of-lies answers before the verdict (53 -> 75-81 of 100). Opt back
+  in with `CHIRP_SPOKEN_CHARS` and `CHIRP_SPOKEN_TAIL` where the rest is
+  shown elsewhere.
+
+### Fixed
+
+- **Calls no longer die on natural speech.** ElevenLabs ends a realtime
+  session (`1000 commit_throttled`) when two commits come within ~200 ms;
+  on natural conversation that ended 10 of 40 calls. Commits are now at
+  least 500 ms apart (0 of 40).
+- **Why speech-to-text failed is kept.** Its close code and reason, or the
+  connection error, become the call's error.
+
+### Changed
+
+- **Faster turn-taking.** After Smart Turn says "unfinished", 1 s of silence
+  ends the turn, not 2.5 s (`CHIRP_TURN_GRACE_MS`). Full-Duplex-Bench, full
+  sets: the same take-overs during pauses (19 vs 20 of 353), turn-taking
+  latency on natural conversation 2.54 s -> 1.59 s.
+
+
 ## 0.3.1 (2026-10-27)
 
 - **SIP:** ACK and BYE must carry chirp's To tag (sent only in the 200
