@@ -31,6 +31,47 @@ const MAX_COALESCED_BYTES: usize = 32_000;
 /// A commit the provider never answers resolves as empty, so one lost
 /// reply can't leave the turn unanswered and the call deaf.
 const COMMIT_DEADLINE: Duration = Duration::from_secs(3);
+/// ElevenLabs ends a session ("1000 commit_throttled") when two commits come
+/// close together: on natural speech every close followed a 119-220 ms gap,
+/// and gaps of 419 ms or more never did. Commits are kept this far apart.
+const MIN_COMMIT_GAP: Duration = Duration::from_millis(500);
+
+/// Spaces speech-to-text commits `MIN_COMMIT_GAP` apart. One that comes too
+/// soon waits; those that wait go out together as one.
+#[derive(Default)]
+struct CommitPacer {
+    last: Option<Instant>,
+    waiting: u32,
+}
+
+impl CommitPacer {
+    /// A commit is wanted at `now`: true to send it now, else it waits.
+    fn ask(&mut self, now: Instant) -> bool {
+        if self.waiting == 0 && self.last.is_none_or(|last| now >= last + MIN_COMMIT_GAP) {
+            self.last = Some(now);
+            return true;
+        }
+        self.waiting += 1;
+        false
+    }
+
+    /// When the waiting commits may go, if any are waiting.
+    fn due(&self) -> Option<Instant> {
+        (self.waiting > 0).then(|| {
+            self.last
+                .map_or_else(Instant::now, |last| last + MIN_COMMIT_GAP)
+        })
+    }
+
+    /// The waiting commits went out as one: how many others were asked for.
+    fn release(&mut self, now: Instant) -> u32 {
+        let others = self.waiting.saturating_sub(1);
+        self.waiting = 0;
+        self.last = Some(now);
+        others
+    }
+}
+
 /// A reply the caller talks over before hearing this much of it answered a
 /// pause, not a finished turn: what they say next continues their question
 /// (`Utterance::continues`). On Big Bench Audio, whose long read questions
@@ -145,6 +186,9 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
     let mut state = CallState::default();
     let mut ended_at: Option<Instant> = None;
     let mut speaking: Option<AbortOnDrop> = None;
+    let mut pacer = CommitPacer::default();
+    // The transcriber's last error, for when its stream then closes.
+    let mut stt_error: Option<String> = None;
     // When the current reply's first audio went out, if it has.
     let mut heard_from: Arc<OnceLock<Instant>> = Arc::default();
     // The current speech answers a user turn (not an unprompted reply).
@@ -215,10 +259,22 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
                 }
                 Some(Transcript::Error(error)) => {
                     let _ = to_client.send(event(json!({ "type": "error", "message": error }))).await;
+                    stt_error = Some(error);
                     continue;
                 }
-                None => anyhow::bail!("speech-to-text stream closed"),
+                None => anyhow::bail!(
+                    "speech-to-text stream closed: {}",
+                    stt_error.as_deref().unwrap_or("no reason given")
+                ),
             },
+            _ = tokio::time::sleep_until(pacer.due().unwrap_or_else(Instant::now).into()), if pacer.due().is_some() => {
+                // Commits that waited out the gap go as one; the call asked
+                // for each, so the others are answered as empty.
+                transcriber.commit().await?;
+                let extra = pacer.release(Instant::now());
+                commit_deadline.as_mut().reset(tokio::time::Instant::now() + COMMIT_DEADLINE);
+                (0..extra).flat_map(|_| state.on(Input::Committed(String::new()))).collect()
+            }
             _ = &mut commit_deadline, if state.pending().1 > 0 => {
                 tracing::warn!(commits = state.pending().1, "speech-to-text never answered; treating as empty");
                 commit_deadline.as_mut().reset(tokio::time::Instant::now() + COMMIT_DEADLINE);
@@ -264,7 +320,9 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
                     commit_deadline
                         .as_mut()
                         .reset(tokio::time::Instant::now() + COMMIT_DEADLINE);
-                    transcriber.commit().await?
+                    if pacer.ask(Instant::now()) {
+                        transcriber.commit().await?
+                    }
                 }
                 Action::Interrupt => {
                     // Barge-in: stop speaking; the brain decides what
@@ -416,5 +474,32 @@ mod future_size {
         type Audio = std::pin::Pin<Box<futures::stream::Empty<Bytes>>>;
         let bytes = size(run::<crate::openai::OpenAiBrain, Audio> as fn(_, _, _, _) -> _);
         assert!(bytes <= 8 * 1024, "a call's future is {bytes} bytes");
+    }
+}
+
+#[cfg(test)]
+mod commit_pacing {
+    use super::*;
+
+    #[test]
+    fn commits_are_spaced_and_waiting_ones_go_as_one() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut pacer = CommitPacer::default();
+        assert!(pacer.ask(at(0)), "the first commit goes at once");
+        assert_eq!(pacer.due(), None);
+        // 150 ms later (what closed real sessions): it waits for the gap.
+        assert!(!pacer.ask(at(150)));
+        assert!(!pacer.ask(at(300)), "another waits with it");
+        assert_eq!(pacer.due(), Some(at(500)));
+        assert_eq!(
+            pacer.release(at(500)),
+            1,
+            "one commit sent, one answered empty"
+        );
+        assert_eq!(pacer.due(), None);
+        assert!(!pacer.ask(at(700)), "the gap runs from the release");
+        assert_eq!(pacer.release(at(1000)), 0);
+        assert!(pacer.ask(at(1600)), "a commit after the gap goes at once");
     }
 }
