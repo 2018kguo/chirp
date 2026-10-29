@@ -87,6 +87,8 @@ cargo run --release --bin call_client -- ws://127.0.0.1:7861/v1/calls question.w
 | `CHIRP_SIP_RTP_PORT` | 7864 | UDP port every phone call's audio shares |
 | `CHIRP_SIP_ALLOW` | any (warned) | addresses or CIDR blocks allowed to place calls: your trunk's |
 | `CHIRP_SIP_RTP_TIMEOUT_SECS` | 10 | a caller silent on RTP this long has gone; chirp hangs up |
+| `CHIRP_SPOKEN_CHARS` | no cap | past this many characters a reply stops at the next sentence end; use only where the rest is shown elsewhere |
+| `CHIRP_SPOKEN_TAIL` | none | said after such a cut, e.g. " The rest is in the transcript." |
 | `CHIRP_DRAIN_SECS` | 30 | after SIGTERM, new calls are refused and calls in progress get this long to end |
 | `CHIRP_MODELS_DIR` | `models` | missing models are downloaded here at startup |
 | `PORT` | 7861 | |

@@ -107,8 +107,23 @@ impl ElevenLabs {
         let (events, received) = mpsc::channel(64);
         tokio::spawn(async move {
             while let Some(Ok(message)) = stream.next().await {
-                let Message::Text(text) = message else {
-                    continue;
+                let text = match message {
+                    Message::Text(text) => text,
+                    // ElevenLabs ending the session: say why, or the call
+                    // only learns it later, as a failed send.
+                    Message::Close(frame) => {
+                        let why = frame.map_or_else(
+                            || "no reason given".to_string(),
+                            |frame| format!("{} {}", u16::from(frame.code), frame.reason),
+                        );
+                        let _ = events
+                            .send(Transcript::Error(format!(
+                                "speech-to-text session closed: {why}"
+                            )))
+                            .await;
+                        break;
+                    }
+                    _ => continue,
                 };
                 let Ok(value) = serde_json::from_str::<Value>(&text) else {
                     continue;

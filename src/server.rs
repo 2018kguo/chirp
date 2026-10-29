@@ -244,7 +244,10 @@ pub async fn shared_from_env() -> anyhow::Result<Shared> {
             env_or("CHIRP_TURN_THREADS", cores.saturating_sub(2).max(1)),
         )?,
         elevenlabs: ElevenLabs::from_env()?,
-        speech: SpeechPolicy::default(),
+        speech: SpeechPolicy {
+            budget_chars: env_or("CHIRP_SPOKEN_CHARS", usize::MAX),
+            budget_tail: std::env::var("CHIRP_SPOKEN_TAIL").unwrap_or_default(),
+        },
         turn_policy: crate::turn_taking::Policy::default(),
         webrtc: webrtc_from_env().await?,
         // ~62 calls per vCPU served cleanly on a c7a (PLAN.md); past the
