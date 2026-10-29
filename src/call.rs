@@ -46,7 +46,9 @@ pub struct Shared {
     pub admission: crate::admission::Admission,
 }
 
-/// How much of a reply is spoken.
+/// How much of a reply is spoken. By default all of it: a cut can drop the
+/// answer itself (Big Bench Audio lost 24 of 25 web-of-lies answers to a
+/// 350-character cap), so cap only where the rest can be found elsewhere.
 #[derive(Clone)]
 pub struct SpeechPolicy {
     /// Past this many characters, speech stops at the next sentence end.
@@ -58,8 +60,8 @@ pub struct SpeechPolicy {
 impl Default for SpeechPolicy {
     fn default() -> Self {
         Self {
-            budget_chars: 350,
-            budget_tail: " The rest is in the transcript.".into(),
+            budget_chars: usize::MAX,
+            budget_tail: String::new(),
         }
     }
 }
