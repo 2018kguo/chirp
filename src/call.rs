@@ -4,7 +4,7 @@
 //! it (closing its text-to-speech stream) without touching the brain, which
 //! decides for itself whether to keep working.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -31,6 +31,11 @@ const MAX_COALESCED_BYTES: usize = 32_000;
 /// A commit the provider never answers resolves as empty, so one lost
 /// reply can't leave the turn unanswered and the call deaf.
 const COMMIT_DEADLINE: Duration = Duration::from_secs(3);
+/// A reply the caller talks over before hearing this much of it answered a
+/// pause, not a finished turn: what they say next continues their question
+/// (`Utterance::continues`). On Big Bench Audio, whose long read questions
+/// pause between sentences, merging scored 75.6 vs 67.6 of 100 (5 runs each).
+const CONTINUES_IF_HEARD_UNDER: Duration = Duration::from_secs(1);
 
 /// Process-wide pieces every call shares.
 #[derive(Clone)]
@@ -140,6 +145,12 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
     let mut state = CallState::default();
     let mut ended_at: Option<Instant> = None;
     let mut speaking: Option<AbortOnDrop> = None;
+    // When the current reply's first audio went out, if it has.
+    let mut heard_from: Arc<OnceLock<Instant>> = Arc::default();
+    // The current speech answers a user turn (not an unprompted reply).
+    let mut answering = false;
+    // The next utterance continues the last one.
+    let mut continues = false;
     // Replies say when they finish, so the state knows the call is quiet.
     // Each reply carries its generation, so a finish queued just before a
     // newer reply started can't mark the newer one finished.
@@ -236,9 +247,10 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
                 if actions.contains(&Action::SpeakUnprompted) {
                     generation += 1;
                     let id = generation;
+                    answering = false;
                     let (shared, to_client, done) = (shared.clone(), to_client.clone(), reply_done_tx.clone());
                     speaking = Some(AbortOnDrop(tokio::spawn(async move {
-                        let result = async { speak(reply, shared.elevenlabs.speaker().await?, &shared.speech, &to_client, None).await };
+                        let result = async { speak(reply, shared.elevenlabs.speaker().await?, &shared.speech, &to_client, None, Arc::default()).await };
                         report(result.await, &to_client).await;
                         let _ = done.send(id).await;
                     })));
@@ -258,6 +270,10 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
                     // Barge-in: stop speaking; the brain decides what
                     // happens to the work behind that reply.
                     speaking = None;
+                    continues = answering
+                        && heard_from
+                            .get()
+                            .is_none_or(|at| at.elapsed() < CONTINUES_IF_HEARD_UNDER);
                     let _ = to_client.send(event(json!({ "type": "interrupt" }))).await;
                 }
                 Action::TurnEnded(by) => {
@@ -286,13 +302,21 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
                         reply_done_tx.clone(),
                     );
                     let started = ended_at.take();
-                    let utterance = Utterance { text, index };
+                    let utterance = Utterance {
+                        text,
+                        index,
+                        continues: std::mem::take(&mut continues),
+                    };
+                    heard_from = Arc::default();
+                    answering = true;
+                    let heard = heard_from.clone();
                     // Replacing the previous reply aborts it.
                     speaking = Some(AbortOnDrop(tokio::spawn(async move {
                         let reply = async {
                             let (speaker, reply) =
                                 tokio::join!(shared.elevenlabs.speaker(), brain.reply(utterance));
-                            speak(reply?, speaker?, &shared.speech, &to_client, started).await
+                            speak(reply?, speaker?, &shared.speech, &to_client, started, heard)
+                                .await
                         };
                         report(reply.await, &to_client).await;
                         let _ = done.send(id).await;
@@ -329,6 +353,7 @@ async fn speak(
     policy: &SpeechPolicy,
     to_client: &mpsc::Sender<ToCaller>,
     turn_ended_at: Option<Instant>,
+    heard_from: Arc<OnceLock<Instant>>,
 ) -> Result<()> {
     let forward_to = to_client.clone();
     // Aborted with this reply: on barge-in, audio already queued must not
@@ -338,6 +363,7 @@ async fn speak(
         while let Some(pcm) = audio.recv().await {
             if first {
                 first = false;
+                let _ = heard_from.set(Instant::now());
                 if let Some(start) = turn_ended_at {
                     metrics::FIRST_AUDIO.record(start.elapsed());
                     let ms = start.elapsed().as_millis() as u64;

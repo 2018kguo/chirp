@@ -263,3 +263,45 @@ async fn a_call_the_brain_factory_refuses_never_starts() {
         .await
         .expect("a call with the token");
 }
+
+/// Remembers whether each utterance continued the one before.
+struct Recording(OpenAiBrain, std::sync::Arc<std::sync::Mutex<Vec<bool>>>);
+
+impl Brain for Recording {
+    async fn reply(&self, utterance: Utterance) -> anyhow::Result<Reply> {
+        self.1.lock().unwrap().push(utterance.continues);
+        self.0.reply(utterance).await
+    }
+}
+
+/// Whether the second question continued the first, when the caller speaks
+/// again `gap` after the first question (over a long reply).
+async fn second_continues(gap: Duration) -> Vec<bool> {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = seen.clone();
+    let url = chirp_with(
+        Script {
+            reply_words: 300,
+            ..Script::default()
+        },
+        move |_, brain| Some(Recording(brain, record.clone())),
+    )
+    .await;
+    let mut audio = question();
+    audio.extend(silence(gap));
+    audio.extend(question());
+    audio.extend(silence(Duration::from_secs(2)));
+    client::play(&url, audio).await.unwrap();
+    let seen = seen.lock().unwrap().clone();
+    seen
+}
+
+/// Talking over a reply before hearing a second of it continues the question
+/// (the turn end was a pause); talking over it later starts a new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn talking_over_a_reply_at_once_continues_the_question() {
+    let at_once = second_continues(Duration::from_millis(1200)).await;
+    assert_eq!(at_once, [false, true], "spoke again right after the pause");
+    let later = second_continues(Duration::from_secs(4)).await;
+    assert_eq!(later, [false, false], "spoke again after hearing the reply");
+}
