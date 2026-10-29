@@ -12,6 +12,7 @@ use axum::Router;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::admission::{Admission, CallPermit};
 use crate::brain::Brain;
@@ -248,7 +249,10 @@ pub async fn shared_from_env() -> anyhow::Result<Shared> {
             budget_chars: env_or("CHIRP_SPOKEN_CHARS", usize::MAX),
             budget_tail: std::env::var("CHIRP_SPOKEN_TAIL").unwrap_or_default(),
         },
-        turn_policy: crate::turn_taking::Policy::default(),
+        turn_policy: crate::turn_taking::Policy {
+            grace: Duration::from_millis(env_or("CHIRP_TURN_GRACE_MS", 1000)),
+            ..crate::turn_taking::Policy::default()
+        },
         webrtc: webrtc_from_env().await?,
         // ~62 calls per vCPU served cleanly on a c7a (PLAN.md); past the
         // limit new calls are refused before they open any paid session.

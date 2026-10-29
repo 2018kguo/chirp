@@ -35,7 +35,10 @@ measurement, its method, and what was tried and rejected.
 | Memory per call | ~133 KB (Linux, jemalloc) | 60–70 MB |
 
 Turn decisions match Pipecat's: speculative transcript commits changed 0 of
-789 verdicts on Pipecat's Smart Turn v3.2 test set.
+789 verdicts on Pipecat's Smart Turn v3.2 test set. After an "unfinished"
+verdict chirp waits 1 s of silence, not Pipecat's 2.5 s: on
+Full-Duplex-Bench that cut the delay before answering a natural turn from
+2.54 s to 1.59 s, with no more cut-ins during pauses.
 
 ## Design
 
@@ -87,6 +90,7 @@ cargo run --release --bin call_client -- ws://127.0.0.1:7861/v1/calls question.w
 | `CHIRP_SIP_RTP_PORT` | 7864 | UDP port every phone call's audio shares |
 | `CHIRP_SIP_ALLOW` | any (warned) | addresses or CIDR blocks allowed to place calls: your trunk's |
 | `CHIRP_SIP_RTP_TIMEOUT_SECS` | 10 | a caller silent on RTP this long has gone; chirp hangs up |
+| `CHIRP_TURN_GRACE_MS` | 1000 | after Smart Turn says "unfinished", this much silence ends the turn anyway (Pipecat: 2500) |
 | `CHIRP_SPOKEN_CHARS` | no cap | past this many characters a reply stops at the next sentence end; use only where the rest is shown elsewhere |
 | `CHIRP_SPOKEN_TAIL` | none | said after such a cut, e.g. " The rest is in the transcript." |
 | `CHIRP_DRAIN_SECS` | 30 | after SIGTERM, new calls are refused and calls in progress get this long to end |
