@@ -110,8 +110,11 @@ prefer the header where the client can set one.
 ## Transports
 
 - **WebSocket**, `GET /v1/calls`: binary messages are 16 kHz mono PCM16 both
-  ways (20 ms frames suit), text messages are JSON events. On `interrupt`,
-  drop any reply audio not yet played.
+  ways (20 ms frames suit), text messages are JSON events. On `hold`
+  (the caller started speaking over the reply), pause playback; on
+  `resume` (it was only a backchannel, "mm-hmm"), play on from there; on
+  `interrupt`, drop any reply audio not yet played. WebRTC and SIP calls
+  do all three server-side.
 - **WebRTC**, `POST /v1/webrtc` with the browser's SDP offer as the body
   (`201` with the answer, as WHIP). Offer one audio track and a data channel;
   events arrive on it. chirp is ICE-lite with one host candidate, and paces

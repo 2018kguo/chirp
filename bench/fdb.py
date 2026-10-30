@@ -43,29 +43,27 @@ def read_16k(path: Path) -> np.ndarray:
 
 
 async def call(url: str, pcm: np.ndarray) -> np.ndarray:
-    """Streams `pcm` in real time; returns what a listener heard, same length."""
+    """Streams `pcm` in real time; returns what a listener heard, same length.
+
+    The listener's player is a 20 ms clock, as WebRTC playout is: it plays
+    queued audio in order, pauses on `hold`, plays on after `resume`, and
+    drops the queue on `interrupt`.
+    """
     duration = len(pcm) / 16000
-    segments: list[list] = []  # [start_s, int16 array], in play order
-    playing_until = 0.0
+    timeline: list[tuple[float, str, np.ndarray | None]] = []  # (t, kind, audio)
     async with websockets.connect(url, max_size=None) as ws:
         start = time.monotonic()
         now = lambda: time.monotonic() - start  # noqa: E731
 
         async def receive():
-            nonlocal playing_until
             async for message in ws:
                 t = now()
                 if isinstance(message, bytes):
-                    audio = np.frombuffer(message, dtype=np.int16)
-                    begin = max(t, playing_until)
-                    segments.append([begin, audio])
-                    playing_until = begin + len(audio) / 16000
-                elif json.loads(message).get("type") == "interrupt":
-                    # Whatever hadn't been played yet is dropped.
-                    for segment in segments:
-                        played = int(max(0.0, t - segment[0]) * 16000)
-                        segment[1] = segment[1][:played]
-                    playing_until = min(playing_until, t)
+                    timeline.append((t, "audio", np.frombuffer(message, dtype=np.int16)))
+                else:
+                    kind = json.loads(message).get("type")
+                    if kind in ("hold", "resume", "interrupt"):
+                        timeline.append((t, kind, None))
 
         receiver = asyncio.create_task(receive())
         data = pcm.tobytes()
@@ -77,12 +75,25 @@ async def call(url: str, pcm: np.ndarray) -> np.ndarray:
             await ws.send(data[frame * FRAME : (frame + 1) * FRAME].ljust(FRAME, b"\0"))
         receiver.cancel()
     out = np.zeros(int(duration * 16000), dtype=np.int16)
-    for begin, audio in segments:
-        at = int(begin * 16000)
-        if at >= len(out) or not len(audio):
-            continue
-        piece = audio[: len(out) - at]
-        out[at : at + len(piece)] = piece
+    queue = np.zeros(0, dtype=np.int16)
+    held = False
+    event = 0
+    for tick in range(len(out) // 320):
+        t = tick * 0.02
+        while event < len(timeline) and timeline[event][0] <= t:
+            _, kind, audio = timeline[event]
+            if kind == "audio":
+                queue = np.concatenate([queue, audio])
+            elif kind == "hold":
+                held = True
+            elif kind == "resume":
+                held = False
+            else:
+                held, queue = False, np.zeros(0, dtype=np.int16)
+            event += 1
+        if not held and len(queue):
+            piece, queue = queue[:320], queue[320:]
+            out[tick * 320 : tick * 320 + len(piece)] = piece
     return out
 
 

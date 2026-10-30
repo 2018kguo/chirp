@@ -31,6 +31,11 @@ const MAX_COALESCED_BYTES: usize = 32_000;
 /// A commit the provider never answers resolves as empty, so one lost
 /// reply can't leave the turn unanswered and the call deaf.
 const COMMIT_DEADLINE: Duration = Duration::from_secs(3);
+/// Speech over a reply that the transcriber hasn't shown to be more than a
+/// backchannel ("mm-hmm", "yeah") interrupts once it lasts this long.
+const OVERLAP_LIMIT: Duration = Duration::from_millis(1500);
+const OVERLAP_RECHECK: Duration = Duration::from_millis(500);
+
 /// ElevenLabs ends a session ("1000 commit_throttled") when two commits come
 /// close together: on natural speech every close followed a 119-220 ms gap,
 /// and gaps of 419 ms or more never did. Commits are kept this far apart.
@@ -187,6 +192,9 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
     let mut ended_at: Option<Instant> = None;
     let mut speaking: Option<AbortOnDrop> = None;
     let mut pacer = CommitPacer::default();
+    let mut overlap_until: Option<Instant> = None;
+    // Whether a reply cut now would be answering a pause (see `continues`).
+    let mut continues_if_cut = false;
     // The transcriber's last error, for when its stream then closes.
     let mut stt_error: Option<String> = None;
     // When the current reply's first audio went out, if it has.
@@ -213,7 +221,26 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
     tokio::pin!(commit_deadline);
 
     loop {
+        // Speech over a reply that is still undecided is a turn once it has
+        // gone on this long, words or not.
+        if state.overlapping() {
+            if overlap_until.is_none() {
+                overlap_until = Some(Instant::now() + OVERLAP_LIMIT);
+                // How much of the reply they had heard when they started.
+                continues_if_cut = answering
+                    && heard_from
+                        .get()
+                        .is_none_or(|at| at.elapsed() < CONTINUES_IF_HEARD_UNDER);
+            }
+        } else {
+            overlap_until = None;
+        }
         let input = tokio::select! {
+            _ = tokio::time::sleep_until(overlap_until.unwrap_or_else(Instant::now).into()), if overlap_until.is_some() => {
+                // In a pause it doesn't count: check again shortly.
+                overlap_until = Some(Instant::now() + OVERLAP_RECHECK);
+                state.on(Input::OverlapTimedOut)
+            }
             pcm = client_rx.next() => {
                 let Some(pcm) = pcm else { break };
                 // Frames that queued while this loop was held up (a slow
@@ -251,7 +278,8 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
             transcript = transcripts.recv() => match transcript {
                 Some(Transcript::Partial(text)) => {
                     let _ = to_client.send(event(json!({ "type": "transcript", "text": text, "final": false }))).await;
-                    continue;
+                    // Speech over a reply: do its words take the turn?
+                    state.on(Input::Heard(text))
                 }
                 Some(Transcript::Committed(text)) => {
                     commit_deadline.as_mut().reset(tokio::time::Instant::now() + COMMIT_DEADLINE);
@@ -324,14 +352,19 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
                         transcriber.commit().await?
                     }
                 }
+                // The client pauses playback (server-paced transports do it
+                // themselves, in `Playout`) until the caller's words decide.
+                Action::Hold => {
+                    let _ = to_client.send(event(json!({ "type": "hold" }))).await;
+                }
+                Action::Resume => {
+                    let _ = to_client.send(event(json!({ "type": "resume" }))).await;
+                }
                 Action::Interrupt => {
                     // Barge-in: stop speaking; the brain decides what
                     // happens to the work behind that reply.
                     speaking = None;
-                    continues = answering
-                        && heard_from
-                            .get()
-                            .is_none_or(|at| at.elapsed() < CONTINUES_IF_HEARD_UNDER);
+                    continues = continues_if_cut;
                     let _ = to_client.send(event(json!({ "type": "interrupt" }))).await;
                 }
                 Action::TurnEnded(by) => {
