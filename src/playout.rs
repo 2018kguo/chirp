@@ -75,6 +75,8 @@ impl<E: FnMut(&[i16; FRAME]) -> Option<Bytes>> Playout<E> {
                 }
                 Err(mpsc::error::TryRecvError::Empty) => return,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // The call is over: nothing will resume what it held.
+                    self.held = false;
                     self.call_ended = true;
                     return;
                 }

@@ -34,6 +34,12 @@ struct World {
     unsent: bool,
     /// That speech is only a backchannel.
     unsent_backchannel: bool,
+    /// That backchannel is "yes".
+    unsent_affirmative: bool,
+    /// Speech in the turn being heard began over a reply...
+    turn_over_reply: bool,
+    /// ...and that reply then finished on its own.
+    heard_out: bool,
     /// The current speech started over a reply.
     over_reply: bool,
     /// The reply's playback is paused (Hold), awaiting Resume or Interrupt.
@@ -54,11 +60,15 @@ enum Speech {
     None,
     Words,
     Backchannel,
+    /// "yes": a backchannel over a reply that is still going, an answer once
+    /// it has ended.
+    Affirmative,
 }
 
 /// What the transcriber makes of the unsent speech.
 fn unsent_text(world: &World) -> String {
     match (world.unsent_backchannel, world.over_reply) {
+        (true, _) if world.unsent_affirmative => "yes".into(),
         (true, true) => "uh-huh".into(),
         (true, false) => "yeah".into(),
         _ => format!("w{}", world.next_word + 1),
@@ -76,6 +86,11 @@ fn moves(world: &World) -> Vec<(Input, Caller, Speech)> {
                 turn(TurnEvent::SpeechStarted),
                 Speaking,
                 Speech::Backchannel,
+            ));
+            next.push((
+                turn(TurnEvent::SpeechStarted),
+                Speaking,
+                Speech::Affirmative,
             ));
         }
         // The VAD can also call the pause before a `Paused` (reporting off,
@@ -120,6 +135,11 @@ fn moves(world: &World) -> Vec<(Input, Caller, Speech)> {
     }
     if let Some(text) = world.in_flight.front() {
         next.push((Input::Committed(text.clone()), world.caller, Speech::None));
+        // The pacer's coalesced commits: an earlier ask answered empty, its
+        // words arriving with the next.
+        if world.in_flight.len() >= 2 {
+            next.push((Input::Committed(String::new()), world.caller, Speech::None));
+        }
     }
     if world.call.speaking() {
         next.push((Input::ReplyFinished, world.caller, Speech::None));
@@ -144,14 +164,30 @@ fn step(world: &World, input: Input, caller: Caller, speech: Speech) -> Result<W
     next.caller = caller;
     if speech != Speech::None {
         // A segment is one kind: words spoken after a backchannel make it words.
-        next.unsent_backchannel =
-            (!next.unsent || next.unsent_backchannel) && speech == Speech::Backchannel;
+        let backchannel = matches!(speech, Speech::Backchannel | Speech::Affirmative);
+        next.unsent_affirmative =
+            (!next.unsent || next.unsent_affirmative) && speech == Speech::Affirmative;
+        next.unsent_backchannel = (!next.unsent || next.unsent_backchannel) && backchannel;
         next.unsent = true;
         // A reply on hold hasn't been heard out: speech then is over it.
         next.over_reply = was_speaking || world.held;
+        next.turn_over_reply = next.over_reply;
     }
-    if let Input::Committed(_) = input {
-        next.in_flight.pop_front();
+    if input == Input::ReplyFinished && next.turn_over_reply {
+        next.heard_out = true;
+    }
+    if let Input::Committed(text) = &input {
+        let front = next.in_flight.pop_front().unwrap_or_default();
+        if text.is_empty() && !front.is_empty() {
+            // Coalesced: this commit's words come with the next one.
+            if let Some(following) = next.in_flight.front_mut() {
+                *following = [front, following.clone()]
+                    .into_iter()
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+        }
     }
     let interrupted = actions.contains(&Action::Interrupt);
     let held = actions.contains(&Action::Hold);
@@ -166,6 +202,22 @@ fn step(world: &World, input: Input, caller: Caller, speech: Speech) -> Result<W
     }
     if resumed && interrupted {
         return Err(format!("both resumed and interrupted on {input:?}"));
+    }
+    let replied = actions.iter().any(|a| matches!(a, Action::Reply { .. }));
+    if replied && (was_speaking || world.held) && !interrupted {
+        return Err(format!("a reply over one still playing or held: {input:?}"));
+    }
+    let concluded = actions
+        .iter()
+        .any(|a| matches!(a, Action::FinalTranscript(_)));
+    let dropped = actions
+        .iter()
+        .any(|a| matches!(a, Action::FinalTranscript(t) if !t.is_empty()))
+        && !replied;
+    if dropped && world.heard_out {
+        return Err(format!(
+            "the reply had ended, but its answer was dropped: {input:?}"
+        ));
     }
     if held {
         next.held = true;
@@ -204,14 +256,18 @@ fn step(world: &World, input: Input, caller: Caller, speech: Speech) -> Result<W
                 };
                 next.unsent = false;
                 next.unsent_backchannel = false;
+                next.unsent_affirmative = false;
                 next.in_flight.push_back(text);
             }
             Action::Reply { text, .. } => {
                 if holds_floor_after {
                     return Err(format!("replied {text:?} while the caller holds the floor"));
                 }
-                if text.split(' ').all(|w| w == "uh-huh") {
-                    return Err(format!("answered a backchannel: {text:?}"));
+                if world.turn_over_reply
+                    && !world.heard_out
+                    && text.split(' ').all(|w| w == "uh-huh" || w == "yes")
+                {
+                    return Err(format!("answered a backchannel over a reply: {text:?}"));
                 }
                 next.replied.push(text);
             }
@@ -219,7 +275,12 @@ fn step(world: &World, input: Input, caller: Caller, speech: Speech) -> Result<W
         }
     }
     // No speech lost or duplicated (a backchannel over a reply may be let go).
-    let kept = |w: &String| w != "uh-huh";
+    if concluded {
+        next.turn_over_reply = false;
+        next.heard_out = false;
+    }
+    // (Dropping a turn is checked above.)
+    let kept = |w: &String| w != "uh-huh" && w != "yes";
     let mut accounted: Vec<String> = next
         .replied
         .iter()
@@ -232,7 +293,13 @@ fn step(world: &World, input: Input, caller: Caller, speech: Speech) -> Result<W
             .filter(|w| !w.is_empty())
             .map(str::to_string),
     );
-    accounted.extend(next.in_flight.iter().filter(|w| !w.is_empty()).cloned());
+    accounted.extend(
+        next.in_flight
+            .iter()
+            .flat_map(|t| t.split(' '))
+            .filter(|w| !w.is_empty())
+            .map(str::to_string),
+    );
     accounted.retain(kept);
     let said: Vec<String> = next.said.iter().filter(|w| kept(w)).cloned().collect();
     if accounted != said {
@@ -253,15 +320,19 @@ fn step(world: &World, input: Input, caller: Caller, speech: Speech) -> Result<W
 
 #[test]
 fn every_interleaving_keeps_the_invariants() {
-    // Speech kinds, partials and the overlap timer widened every step:
-    // 22 is ~3M states (24 is 9M and passes too, in ~50 s); every bug the
-    // held barge-in had was found within 8 steps.
-    const DEPTH: usize = 22;
+    // Speech kinds (words, backchannel, "yes"), partials, the overlap timer
+    // and coalesced commits widen every step: 16 is 3.8M states (~17 s);
+    // 18 (16.9M) passes too. Every bug the hold/resume change had was found
+    // within 11 steps.
+    const DEPTH: usize = 16;
     let start = World {
         call: CallState::default(),
         caller: Caller::Idle,
         unsent: false,
         unsent_backchannel: false,
+        unsent_affirmative: false,
+        turn_over_reply: false,
+        heard_out: false,
         over_reply: false,
         held: false,
         next_word: 0,

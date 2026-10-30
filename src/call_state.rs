@@ -66,6 +66,12 @@ pub struct CallState {
     began_over_reply: bool,
     /// The caller is speaking now (not paused mid-turn).
     voiced: bool,
+    /// The reply finished on its own during that turn: the caller then
+    /// answers it ("yes"), rather than backchanneling.
+    heard_out: bool,
+    /// Counts stretches of speech over a reply, so the overlap timer can
+    /// start over with each.
+    overlap_stretch: u32,
     user_turn: u32,
 }
 
@@ -83,6 +89,12 @@ impl CallState {
     /// Speech over a reply is still undecided (see `Input::OverlapTimedOut`).
     pub fn overlapping(&self) -> bool {
         self.overlapping
+    }
+
+    /// Which stretch of speech over a reply this is: the overlap timer times
+    /// each stretch's own speech.
+    pub fn overlap_stretch(&self) -> u32 {
+        self.overlap_stretch
     }
 
     /// The caller is taking the turn: stop the reply, and drop what playback
@@ -126,7 +138,11 @@ impl CallState {
                     actions.push(Action::Hold);
                 }
                 self.overlapping = over_reply;
+                // Speech into silence (the reply cut or done) is a turn.
                 self.began_over_reply = over_reply;
+                if over_reply {
+                    self.overlap_stretch += 1;
+                }
             }
             // The VAD called the pause.
             Input::Turn(TurnEvent::Assessed { .. }) => self.voiced = false,
@@ -155,9 +171,12 @@ impl CallState {
                 let text = text.trim();
                 if self.overlapping {
                     if is_backchannel(text) {
-                        // Heard, and let be: the reply plays on.
-                        self.overlapping = false;
-                        self.resume(&mut actions);
+                        // Heard, and let be. The reply plays on only once
+                        // nothing newer is still to be judged.
+                        if self.commits_in_flight == 0 && !self.uncommitted_speech {
+                            self.overlapping = false;
+                            self.resume(&mut actions);
+                        }
                         return self.answer(actions);
                     }
                     self.interrupt(&mut actions);
@@ -171,7 +190,10 @@ impl CallState {
             }
             // Speech begun over the reply still answers the reply, even if
             // the reply ends first: a backchannel stays one.
-            Input::ReplyFinished => self.speaking = false,
+            Input::ReplyFinished => {
+                self.speaking = false;
+                self.heard_out |= self.began_over_reply;
+            }
             Input::Heard(text) => {
                 if self.overlapping && !is_backchannel(&text) {
                     self.interrupt(&mut actions);
@@ -198,11 +220,19 @@ impl CallState {
     fn answer(&mut self, mut actions: Vec<Action>) -> Vec<Action> {
         if self.awaiting_answer && self.commits_in_flight == 0 && !self.in_turn {
             self.awaiting_answer = false;
-            // Speech over the reply that never became a turn: it goes on.
+            // Speech over a reply that is still going, and only backchannel:
+            // it goes on. Once the reply is over, the same words ("yes")
+            // answer it.
             self.overlapping = false;
-            self.resume(&mut actions);
-            let backchannel =
-                std::mem::take(&mut self.began_over_reply) && is_backchannel(&self.turn_text);
+            let began_over_reply = std::mem::take(&mut self.began_over_reply);
+            let heard_out = std::mem::take(&mut self.heard_out);
+            let backchannel = began_over_reply && !heard_out && is_backchannel(&self.turn_text);
+            if backchannel || self.turn_text.is_empty() {
+                self.resume(&mut actions);
+            } else {
+                // Never a reply over one still playing or held.
+                self.interrupt(&mut actions);
+            }
             let text = std::mem::take(&mut self.turn_text);
             actions.push(Action::FinalTranscript(text.clone()));
             if !text.is_empty() && !backchannel {

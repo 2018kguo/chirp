@@ -193,6 +193,7 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
     let mut speaking: Option<AbortOnDrop> = None;
     let mut pacer = CommitPacer::default();
     let mut overlap_until: Option<Instant> = None;
+    let mut overlap_stretch = 0u32;
     // Whether a reply cut now would be answering a pause (see `continues`).
     let mut continues_if_cut = false;
     // The transcriber's last error, for when its stream then closes.
@@ -224,6 +225,11 @@ async fn run_inner<B: Brain, S: Stream<Item = Bytes> + Unpin>(
         // Speech over a reply that is still undecided is a turn once it has
         // gone on this long, words or not.
         if state.overlapping() {
+            // Each stretch of speech over the reply gets its own limit.
+            if overlap_stretch != state.overlap_stretch() && overlap_until.is_some() {
+                overlap_until = Some(Instant::now() + OVERLAP_LIMIT);
+            }
+            overlap_stretch = state.overlap_stretch();
             if overlap_until.is_none() {
                 overlap_until = Some(Instant::now() + OVERLAP_LIMIT);
                 // How much of the reply they had heard when they started.
