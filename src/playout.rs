@@ -25,6 +25,9 @@ pub struct Playout<E> {
     /// Audio short of a whole frame, waiting for the rest.
     partial: Vec<i16>,
     frames: VecDeque<Bytes>,
+    /// The caller is speaking over the reply: nothing plays until `resume`
+    /// (or an `interrupt` drops it).
+    held: bool,
     call_ended: bool,
 }
 
@@ -35,6 +38,7 @@ impl<E: FnMut(&[i16; FRAME]) -> Option<Bytes>> Playout<E> {
             encode,
             partial: Vec::with_capacity(FRAME),
             frames: VecDeque::new(),
+            held: false,
             call_ended: false,
         }
     }
@@ -55,7 +59,13 @@ impl<E: FnMut(&[i16; FRAME]) -> Option<Bytes>> Playout<E> {
                     }
                 }
                 Ok(ToCaller::Event(event)) => {
+                    if event["type"] == "hold" {
+                        self.held = true;
+                    } else if event["type"] == "resume" {
+                        self.held = false;
+                    }
                     if event["type"] == "interrupt" {
+                        self.held = false;
                         self.partial.clear();
                         self.frames.clear();
                         // A long reply's queue is not kept for the rest of the call.
@@ -84,6 +94,9 @@ impl<E: FnMut(&[i16; FRAME]) -> Option<Bytes>> Playout<E> {
     /// The next encoded 20 ms to play, if any. When the queue runs dry, a
     /// short tail is padded with silence and played rather than held.
     pub fn frame(&mut self) -> Option<Bytes> {
+        if self.held {
+            return None;
+        }
         if self.frames.is_empty() && !self.partial.is_empty() {
             self.encode_partial();
         }
@@ -137,5 +150,25 @@ mod tests {
         drop(to);
         playout.take(|_| {});
         assert!(playout.finished());
+    }
+
+    #[tokio::test]
+    async fn a_hold_pauses_playback_and_a_resume_plays_on_from_there() {
+        let (to, from) = mpsc::channel(16);
+        let mut playout = Playout::new(from, |frame: &[i16; FRAME]| {
+            Some(Bytes::copy_from_slice(&frame[0].to_le_bytes()))
+        });
+        to.send(pcm(FRAME * 3)).await.unwrap();
+        to.send(ToCaller::Event(json!({ "type": "hold" })))
+            .await
+            .unwrap();
+        playout.take(|_| {});
+        assert!(playout.frame().is_none(), "played while held");
+        to.send(ToCaller::Event(json!({ "type": "resume" })))
+            .await
+            .unwrap();
+        playout.take(|_| {});
+        let played = std::iter::from_fn(|| playout.frame()).count();
+        assert_eq!(played, 3, "the held frames all play after the resume");
     }
 }

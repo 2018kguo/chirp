@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0 (2026-10-30)
+
+- **Backchannels don't stop the reply.** Speech over a reply pauses it at
+  once (`hold`), and the transcriber's words decide: a backchannel or noise
+  ("mm-hmm", "yeah", a cough) plays on from the pause (`resume`) and isn't
+  answered as a turn; real words, or more than 1.5 s of speech, interrupt.
+  WebRTC and SIP pause and resume server-side; WebSocket clients get
+  `hold` and `resume` events. Full-Duplex-Bench v1.5, 40 each, vs 0.4.0:
+  backchannels the reply carried on through 0.28 -> 0.85 (silent after
+  0.65 -> 0.15; speaking again 0.23 s after vs 1.06 s), interruptions
+  answered 0.45 -> 0.47, the reply stopping 0.38 s vs 0.35 s after the
+  caller cut in.
+- The call reducer's model check covers backchannels, partial transcripts
+  and the overlap timer (it found five bugs in this change before it ran).
+
+
 ## 0.4.0 (2026-10-29)
 
 Fixes found by running two public speech-to-speech benchmarks against chirp

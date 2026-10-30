@@ -45,7 +45,12 @@ Full-Duplex-Bench v1, full sets, 1 s grace (0.4) vs 2.5 s (Pipecat's):
 | Smooth turn-taking (Candor 119): turns taken | 1.00 | 0.97 |
 | Smooth turn-taking: latency | 1.59 s | 2.54 s |
 
-Full-Duplex-Bench v1.5 (40 each, GPT-4o behavior judge): user interruption
-C_RESPOND 0.38, C_RESUME 0.33, C_UNKNOWN 0.23; user backchannel C_RESUME
-0.30, C_UNKNOWN 0.68 (chirp stops for an "uh-huh" and says nothing more,
-the next thing to fix).
+Full-Duplex-Bench v1.5 (40 each, GPT-4o behavior judge; `fdb.py` plays
+chirp's audio on a 20 ms clock and honors `hold`/`resume`/`interrupt`):
+
+| | 0.4.0 | 0.5.0 (hold, then resume or interrupt) |
+|---|---|---|
+| Backchannel: reply carries on (C_RESUME) | 0.28 | 0.85 |
+| Backchannel: silent after (C_UNKNOWN) | 0.65 | 0.15 |
+| Interruption: answered (C_RESPOND) | 0.45 | 0.47 |
+| Interruption: reply stops after (median) | 0.35 s | 0.38 s |

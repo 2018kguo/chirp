@@ -305,3 +305,32 @@ async fn talking_over_a_reply_at_once_continues_the_question() {
     let later = second_continues(Duration::from_secs(4)).await;
     assert_eq!(later, [false, false], "spoke again after hearing the reply");
 }
+
+/// "Mm-hmm" over a reply is a backchannel: the reply goes on, and it isn't
+/// answered as a turn of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backchannel_over_a_reply_neither_stops_it_nor_is_answered() {
+    let url = chirp_on(Script {
+        transcript: "Mm-hmm.".into(),
+        reply_words: 300,
+        brain_token_gap: Duration::from_millis(2),
+        ..Script::default()
+    })
+    .await;
+    let mut audio = question();
+    audio.extend(silence(Duration::from_millis(2500)));
+    // Under a second of speech, as a "mm-hmm" is.
+    audio.extend(&question()[..16_000 * 8 / 10]);
+    audio.extend(silence(Duration::from_secs(3)));
+    let outcome = client::play(&url, audio).await.unwrap();
+    assert!(
+        outcome.event_at("interrupt", |_| true).is_none(),
+        "a backchannel stopped the reply"
+    );
+    let replies = outcome
+        .events
+        .iter()
+        .filter(|(_, e)| e["type"] == "metrics")
+        .count();
+    assert_eq!(replies, 1, "the backchannel was answered as a turn");
+}
