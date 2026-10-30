@@ -50,7 +50,7 @@ chirp's audio on a 20 ms clock and honors `hold`/`resume`/`interrupt`):
 
 | | 0.4.0 | 0.5.0 (hold, then resume or interrupt) |
 |---|---|---|
-| Backchannel: reply carries on (C_RESUME) | 0.28 | 0.85 |
-| Backchannel: silent after (C_UNKNOWN) | 0.65 | 0.15 |
-| Interruption: answered (C_RESPOND) | 0.45 | 0.47 |
-| Interruption: reply stops after (median) | 0.35 s | 0.38 s |
+| Backchannel: reply carries on (C_RESUME) | 0.28 | 0.90 |
+| Backchannel: silent after (C_UNKNOWN) | 0.65 | 0.07 |
+| Interruption: answered (C_RESPOND) | 0.45 | 0.53 |
+| Interruption: reply stops after (median) | 0.35 s | 0.32 s |

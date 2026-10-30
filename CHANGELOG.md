@@ -3,18 +3,21 @@
 ## 0.5.0 (2026-10-30)
 
 - **Backchannels don't stop the reply.** Speech over a reply pauses it at
-  once (`hold`), and the transcriber's words decide: a backchannel or noise
-  ("mm-hmm", "yeah", a cough) plays on from the pause (`resume`) and isn't
-  answered as a turn; real words, or more than 1.5 s of speech, interrupt.
-  WebRTC and SIP pause and resume server-side; WebSocket clients get
-  `hold` and `resume` events. Full-Duplex-Bench v1.5, 40 each, vs 0.4.0:
-  backchannels the reply carried on through 0.28 -> 0.85 (silent after
-  0.65 -> 0.15; speaking again 0.23 s after vs 1.06 s), interruptions
-  answered 0.45 -> 0.47, the reply stopping 0.38 s vs 0.35 s after the
-  caller cut in.
-- The call reducer's model check covers backchannels, partial transcripts
-  and the overlap timer (it found five bugs in this change before it ran).
-
+  once (`hold`) and the transcriber's words decide. Only backchannel words
+  or none ("mm-hmm", "yeah", a cough) resume from the pause and go
+  unanswered; real words, or 1.5 s of one stretch of speech, interrupt.
+  "Yes" over a reply that then finishes on its own is answered. WebRTC and
+  SIP pause and resume server-side. Full-Duplex-Bench v1.5, 40 each, vs
+  0.4.0: the reply carried on through a backchannel 0.28 -> 0.90 (silent
+  after 0.65 -> 0.07); interruptions answered 0.45 -> 0.53, the reply
+  stopping 0.32 s vs 0.35 s after the caller cut in. Big Bench Audio
+  unchanged (76, 73 of 100).
+- **WebSocket clients:** honor the new `hold` and `resume` events. A client
+  that ignores them keeps playing over the caller until the interrupt, up
+  to ~1.5 s later than before, and plays on through backchannels.
+- The call reducer's model check now covers backchannels, "yes", partial
+  transcripts, the overlap timer and coalesced commits; with an
+  adversarial review it caught eight bugs in this change before release.
 
 ## 0.4.0 (2026-10-29)
 
